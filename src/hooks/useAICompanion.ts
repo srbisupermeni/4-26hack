@@ -1,6 +1,12 @@
 import { useState, useEffect, useRef } from 'react';
 import { GameContext } from './useGameSimulation';
 import { captureFrame, fingerprintDiff, CapturedFrame } from '../lib/frameCapture';
+import {
+  requestPipelineReaction,
+  type PipelineInputResult,
+  type PipelineStatus,
+  type PipelineTriggerReason,
+} from '../lib/pipelineClient';
 
 export type ChatMessage = {
   id: string;
@@ -10,11 +16,15 @@ export type ChatMessage = {
 
 export type PersonaType = 'analyst' | 'trash_talker' | 'emotional';
 
-type TriggerReason =
-  | 'user_message'
-  | 'visual_event'
-  | 'score_change'
-  | 'idle_break';
+type TriggerReason = PipelineTriggerReason;
+
+export type PipelineUiState = {
+  status: PipelineStatus;
+  input?: PipelineInputResult;
+  outputModel?: string;
+  error?: string;
+  updatedAt?: number;
+};
 
 export interface VisionCompanionOptions {
   /** The <video> element the AI should be "watching". */
@@ -48,6 +58,9 @@ export function useAICompanion(
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [visionTimeline, setVisionTimeline] = useState<{timestamp: number, comment: string}[]>([]);
   const [isVisionLive, setIsVisionLive] = useState(false);
+  const [pipelineState, setPipelineState] = useState<PipelineUiState>({
+    status: 'idle',
+  });
 
   const previousPlayRef = useRef<string>('');
   const lastBroadcastTime = useRef<number>(0);
@@ -197,8 +210,66 @@ export function useAICompanion(
     return () => window.clearInterval(id);
   }, [visionEnabled, videoRef, isTyping]);
 
+  const runPipelineReaction = async ({
+    reason,
+    userMessage,
+    frames = [],
+    history = messages.slice(-6),
+    appendMessage = true,
+  }: {
+    reason: TriggerReason;
+    userMessage?: string;
+    frames?: string[];
+    history?: ChatMessage[];
+    appendMessage?: boolean;
+  }) => {
+    setPipelineState({
+      status: frames.length > 0 ? 'capturing' : 'understanding',
+      updatedAt: Date.now(),
+    });
+
+    const result = await requestPipelineReaction({
+      triggerReason: reason,
+      userMessage,
+      frames,
+      gameContext,
+      persona,
+      activeSport: activeSport || 'NBA',
+      chatHistory: history,
+    });
+
+    setPipelineState({
+      status: 'generating',
+      input: result.input,
+      outputModel: result.output.model,
+      updatedAt: Date.now(),
+    });
+
+    const text = result.output.text.trim();
+    if (appendMessage && text) {
+      setMessages(prev => [...prev, {
+        id: Date.now().toString(),
+        role: 'ai',
+        content: text,
+      }]);
+    }
+
+    setPipelineState({
+      status: 'complete',
+      input: result.input,
+      outputModel: result.output.model,
+      updatedAt: Date.now(),
+    });
+
+    if (result.output.shouldSpeak && text) {
+      queueVoice(text);
+    }
+
+    return text;
+  };
+
   // ---------------------------------------------------------------------------
-  // Core trigger → /api/chat/vision streaming call.
+  // Core trigger → pipeline adapter call.
   // ---------------------------------------------------------------------------
   const triggerBroadcast = async (reason: TriggerReason) => {
     if (inFlightVisionRef.current || isTyping) return;
@@ -218,54 +289,9 @@ export function useAICompanion(
     lastBroadcastTime.current = now;
     inFlightVisionRef.current = true;
     setIsTyping(true);
-    const fallbackTimeout = setTimeout(() => setIsTyping(false), 15000);
 
     try {
-      const response = await fetch('/api/chat/vision', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          triggerReason: reason,
-          frames: framesToSend,
-          gameContext,
-          persona,
-          activeSport: activeSport || 'NBA',
-          // Light context — last few turns only, avoid prompt bloat.
-          chatHistory: messages.slice(-6),
-        }),
-      });
-      if (!response.ok) throw new Error(`vision broadcast ${response.status}`);
-
-      const reader = response.body?.getReader();
-      if (!reader) throw new Error('no reader');
-      const decoder = new TextDecoder('utf-8');
-
-      const aiMsgId = Date.now().toString();
-      clearTimeout(fallbackTimeout);
-      setIsTyping(false);
-      setMessages(prev => [...prev, { id: aiMsgId, role: 'ai', content: '' }]);
-
-      let fullText = '';
-      let processedLength = 0;
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        fullText += decoder.decode(value, { stream: true });
-        
-        const unprocessed = fullText.slice(processedLength);
-        const match = unprocessed.match(/[^.!?]+[.!?]+/g);
-        if (match) {
-            for (const sentence of match) {
-                queueVoice(sentence.trim());
-                processedLength += sentence.length;
-            }
-        }
-        
-        setMessages(prev => prev.map(m => m.id === aiMsgId ? { ...m, content: fullText } : m));
-      }
-
-      const remainder = fullText.slice(processedLength).trim();
-      if (remainder) queueVoice(remainder);
+      await runPipelineReaction({ reason, frames: framesToSend });
       // Visual/score events put us in "waiting for user" mode so we don't
       // talk over ourselves. Idle breaks don't — they're self-gated.
       if (reason === 'visual_event' || reason === 'score_change') {
@@ -273,16 +299,20 @@ export function useAICompanion(
       }
     } catch (err) {
       console.warn('vision broadcast skipped:', err);
+      setPipelineState({
+        status: 'error',
+        error: err instanceof Error ? err.message : 'Pipeline broadcast failed',
+        updatedAt: Date.now(),
+      });
     } finally {
-      clearTimeout(fallbackTimeout);
       inFlightVisionRef.current = false;
       setIsTyping(false);
     }
   };
 
   // ---------------------------------------------------------------------------
-  // Auto-broadcast on NBA play change. Routes through vision if we have frames,
-  // otherwise falls back to the text-only /api/chat path (preserves legacy).
+  // Auto-broadcast on NBA play change. Routes every path through the pipeline
+  // adapter so the input-model and output-model handoff stays consistent.
   // ---------------------------------------------------------------------------
   useEffect(() => {
     if (!gameContext.lastPlay) return;
@@ -298,6 +328,7 @@ export function useAICompanion(
     const cooldown = gameContext.isReplay ? 5000 : 8000;
     if (now - lastBroadcastTime.current < cooldown) return;
     if (waitingForUserRef.current) return;
+    if (inFlightVisionRef.current || isTyping) return;
 
     // Upgrade to vision broadcast when frames are available.
     if (visionEnabled && frameBufferRef.current.length > 0) {
@@ -305,56 +336,26 @@ export function useAICompanion(
       return;
     }
 
-    // Legacy text-only auto-broadcast.
     lastBroadcastTime.current = now;
+    inFlightVisionRef.current = true;
+    setIsTyping(true);
 
     const runTextBroadcast = async () => {
-      if (isTyping) return;
-      setIsTyping(true);
-      const fallbackTimeout = setTimeout(() => setIsTyping(false), 12000);
       try {
-        const response = await fetch('/api/chat', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ isAutoBroadcast: true, gameContext, persona, activeSport: activeSport || 'NBA' }),
+        await runPipelineReaction({
+          reason: 'score_change',
+          frames: [],
         });
-        if (!response.ok) throw new Error('Failed broadcast');
-
-        const reader = response.body?.getReader();
-        if (!reader) throw new Error('No reader');
-        const decoder = new TextDecoder('utf-8');
-
-        const aiMsgId = Date.now().toString();
-        clearTimeout(fallbackTimeout);
-        setIsTyping(false);
-        setMessages(prev => [...prev, { id: aiMsgId, role: 'ai', content: '' }]);
-
-        let fullText = '';
-        let processedLength = 0;
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          fullText += decoder.decode(value, { stream: true });
-          
-          const unprocessed = fullText.slice(processedLength);
-          const match = unprocessed.match(/[^.!?]+[.!?]+/g);
-          if (match) {
-              for (const sentence of match) {
-                  queueVoice(sentence.trim());
-                  processedLength += sentence.length;
-              }
-          }
-          
-          setMessages(prev => prev.map(m => m.id === aiMsgId ? { ...m, content: fullText } : m));
-        }
-
-        const remainder = fullText.slice(processedLength).trim();
-        if (remainder) queueVoice(remainder);
         waitingForUserRef.current = true;
       } catch (error) {
         console.error("Auto broadcast skipped:", error);
+        setPipelineState({
+          status: 'error',
+          error: error instanceof Error ? error.message : 'Pipeline broadcast failed',
+          updatedAt: Date.now(),
+        });
       } finally {
-        clearTimeout(fallbackTimeout);
+        inFlightVisionRef.current = false;
         setIsTyping(false);
       }
     };
@@ -363,77 +364,36 @@ export function useAICompanion(
   }, [gameContext.lastPlay, gameContext.score, persona, visionEnabled]);
 
   // ---------------------------------------------------------------------------
-  // User-initiated message. Uses vision endpoint when frames are available.
+  // User-initiated message. Uses the same pipeline adapter with optional frames.
   // ---------------------------------------------------------------------------
   const sendMessage = async (text: string) => {
     waitingForUserRef.current = false;
     const userMsg: ChatMessage = { id: Date.now().toString(), role: 'user', content: text };
     setMessages(prev => [...prev, userMsg]);
     setIsTyping(true);
-    const fallbackTimeout = setTimeout(() => setIsTyping(false), 10000);
-
-    const useVision = visionEnabled && frameBufferRef.current.length > 0;
-    const endpoint = useVision ? '/api/chat/vision' : '/api/chat';
-    const body: Record<string, unknown> = {
-      userMessage: text,
-      chatHistory: messages,
-      gameContext,
-      persona,
-      activeSport: activeSport || 'NBA',
-    };
-    if (useVision) {
-      body.triggerReason = 'user_message';
-      body.frames = frameBufferRef.current.slice(-2).map(f => f.dataUrl);
-    }
+    const framesToSend = visionEnabled
+      ? frameBufferRef.current.slice(-2).map(f => f.dataUrl)
+      : [];
 
     try {
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+      await runPipelineReaction({
+        reason: 'user_message',
+        userMessage: text,
+        frames: framesToSend,
+        history: messages.slice(-6),
       });
-      if (!response.ok) throw new Error('Failed to generate response');
-
-      const reader = response.body?.getReader();
-      if (!reader) throw new Error('No reader available');
-
-      const decoder = new TextDecoder('utf-8');
-      const aiMsgId = (Date.now() + 1).toString();
-      clearTimeout(fallbackTimeout);
-      setIsTyping(false);
-
-      setMessages(prev => [...prev, { id: aiMsgId, role: 'ai', content: '' }]);
-
-      let fullText = '';
-      let processedLength = 0;
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        fullText += decoder.decode(value, { stream: true });
-        
-        const unprocessed = fullText.slice(processedLength);
-        const match = unprocessed.match(/[^.!?]+[.!?]+/g);
-        if (match) {
-            for (const sentence of match) {
-                queueVoice(sentence.trim());
-                processedLength += sentence.length;
-            }
-        }
-        
-        setMessages(prev => prev.map(m => m.id === aiMsgId ? { ...m, content: fullText } : m));
-      }
-
-      const remainder = fullText.slice(processedLength).trim();
-      if (remainder) queueVoice(remainder);
-
       // User-triggered → reset cooldown so the AI doesn't immediately fire another proactive broadcast.
       lastBroadcastTime.current = Date.now();
     } catch (error) {
       console.error(error);
+      setPipelineState({
+        status: 'error',
+        error: error instanceof Error ? error.message : 'Pipeline message failed',
+        updatedAt: Date.now(),
+      });
       const errorMsg: ChatMessage = { id: (Date.now() + 1).toString(), role: 'ai', content: 'Connection issue. I missed that, sorry!' };
       setMessages(prev => [...prev, errorMsg]);
     } finally {
-      clearTimeout(fallbackTimeout);
       setIsTyping(false);
     }
   };
@@ -569,5 +529,6 @@ export function useAICompanion(
     hasVisionData: visionTimeline.length > 0,
     /** True once the real-time perception loop has seen at least one frame. */
     isVisionLive,
+    pipelineState,
   };
 }

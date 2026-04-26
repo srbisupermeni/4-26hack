@@ -1,7 +1,7 @@
 import React, { useRef, useState } from 'react';
 import { Send, Volume2, VolumeX, Mic, MicOff } from 'lucide-react';
 import { cn } from '../lib/utils';
-import { ChatMessage, PersonaType } from '../hooks/useAICompanion';
+import type { ChatMessage, PersonaType, PipelineUiState } from '../hooks/useAICompanion';
 import { AIAvatarOrb, AvatarVariant } from './AIAvatarOrb';
 
 interface PetChatPanelProps {
@@ -22,6 +22,7 @@ interface PetChatPanelProps {
   excitement?: number;
   /** '2d' (default), '3d' (premium VRM), or 'image' (legacy). */
   avatarVariant?: AvatarVariant;
+  pipelineState?: PipelineUiState;
 }
 
 export function PetChatPanel({
@@ -32,6 +33,7 @@ export function PetChatPanel({
   analyser,
   excitement = 0,
   avatarVariant = '2d',
+  pipelineState,
 }: PetChatPanelProps) {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const recognitionRef = useRef<any>(null);
@@ -73,6 +75,14 @@ export function PetChatPanel({
     : isTyping
     ? 'Thinking...'
     : lastAiMessage?.content ?? 'Hey! Ready to watch? Ask me anything!';
+  const pipelineLabel = pipelineState ? {
+    idle: 'Standing by',
+    capturing: 'Capturing input',
+    understanding: 'Input adapter',
+    generating: 'Output model',
+    complete: 'Ready',
+    error: 'Needs retry',
+  }[pipelineState.status] : 'Standing by';
 
   return (
     <div className="w-full md:w-1/3 flex flex-col bg-black/20">
@@ -101,6 +111,27 @@ export function PetChatPanel({
           </button>
         </div>
       </div>
+
+      {/* Pipeline status */}
+      {pipelineState && (
+        <div className="px-4 py-3 border-b border-white/5 bg-black/30">
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-[10px] font-bold uppercase tracking-widest text-white/40">Model Pipeline</span>
+            <span className={cn(
+              "text-[10px] font-bold uppercase tracking-widest",
+              pipelineState.status === 'error' ? "text-red-400" :
+              pipelineState.status === 'complete' ? "text-emerald-400" :
+              pipelineState.status === 'idle' ? "text-white/30" :
+              "text-brand-purple"
+            )}>
+              {pipelineLabel}
+            </span>
+          </div>
+          <p className="line-clamp-2 text-[11px] leading-relaxed text-white/55">
+            {pipelineState.input?.summary || 'Waiting for video, chat, or game-state input.'}
+          </p>
+        </div>
+      )}
 
       {/* Persona selector */}
       <div className="flex bg-black/40 border-b border-white/5 px-2 py-1.5 gap-1">

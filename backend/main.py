@@ -299,6 +299,139 @@ async def get_historical_pbp(game_id: str):
         return Response(status_code=404, content="Game not found")
     return {"plays": timeline}
 
+@app.post("/api/pipeline/react")
+async def pipeline_react(request: Request):
+    """Stable adapter for the hackathon pipeline.
+
+    The endpoint intentionally separates the input-understanding result from
+    the output model result so the two model owners can replace either side
+    without changing the webpage contract.
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+
+    trigger_reason = data.get("triggerReason", "user_message")
+    user_message = (data.get("userMessage") or "").strip()
+    game_context = data.get("gameContext", {}) or {}
+    active_sport = data.get("activeSport", "NBA")
+    persona = data.get("persona", "analyst")
+    frames = data.get("frames", []) or []
+    chat_history = data.get("chatHistory", []) or []
+
+    frame_count = min(len(frames), 3)
+    score = game_context.get("score", "unknown")
+    clock = game_context.get("clock", "unknown")
+    last_play = game_context.get("lastPlay", "No play detected yet.")
+
+    if user_message and frame_count:
+        source = "hybrid"
+    elif frame_count:
+        source = "vision"
+    elif trigger_reason == "score_change":
+        source = "scoreboard"
+    else:
+        source = "text"
+
+    tags = [str(active_sport).lower(), str(trigger_reason)]
+    if frame_count:
+        tags.append("frames")
+    if game_context.get("isReplay"):
+        tags.append("replay")
+    if user_message:
+        tags.append("user_prompt")
+
+    if trigger_reason == "visual_event":
+        summary = f"Detected a visual change from {frame_count} recent frame(s) while {active_sport} is playing."
+    elif trigger_reason == "score_change":
+        summary = f"Scoreboard changed to {score}; latest play is: {last_play}"
+    elif trigger_reason == "idle_break":
+        summary = f"Viewer has been quiet; use the current {active_sport} context to make a light observation."
+    elif user_message:
+        summary = f"User asked: {user_message}"
+    else:
+        summary = f"Use the current {active_sport} game context to react naturally."
+
+    input_result = {
+        "source": source,
+        "eventType": trigger_reason,
+        "summary": summary,
+        "confidence": 0.86 if frame_count or trigger_reason == "score_change" else 0.72,
+        "tags": tags,
+        "signals": [
+            f"score={score}",
+            f"clock={clock}",
+            f"last_play={last_play}",
+            f"frames={frame_count}",
+        ],
+    }
+
+    base_prompts = {
+        "analyst": "You are a calm, highly analytical AI sports companion.",
+        "trash_talker": "You are a sarcastic trash-talking AI sports companion.",
+        "emotional": "You are an overly passionate die-hard fan AI companion.",
+    }
+    persona_prompt = base_prompts.get(persona, base_prompts["analyst"])
+    fallback_text = (
+        f"I've got the handoff: {input_result['summary']} "
+        f"That is the moment to watch right now."
+    )
+    output_model = "adapter:mock"
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if api_key:
+        try:
+            history_excerpt = [
+                {
+                    "role": "assistant" if msg.get("role") == "ai" else "user",
+                    "content": (msg.get("content") or "")[:300],
+                }
+                for msg in chat_history[-4:]
+                if (msg.get("content") or "").strip()
+            ]
+            client = AsyncOpenAI(api_key=api_key)
+            response = await client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            f"{persona_prompt} You are the output model in a two-stage "
+                            "pipeline. React to the structured input result, not raw logs. "
+                            "Keep it conversational, punchy, and at most 2 sentences."
+                        ),
+                    },
+                    *history_excerpt,
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Sport: {active_sport}\n"
+                            f"Structured input: {input_result}\n"
+                            f"User message: {user_message or 'No direct user prompt.'}"
+                        ),
+                    },
+                ],
+                timeout=10.0,
+                max_tokens=120,
+            )
+            generated = response.choices[0].message.content
+            if generated:
+                fallback_text = generated.strip()
+                output_model = "gpt-4o-mini via output-adapter"
+        except Exception as e:
+            fallback_text = f"{fallback_text} (Output adapter fallback: {str(e)[:60]}...)"
+
+    return {
+        "status": "complete",
+        "input": input_result,
+        "output": {
+            "text": fallback_text,
+            "model": output_model,
+            "shouldSpeak": True,
+        },
+    }
+
 @app.post("/api/chat/summary")
 async def chat_summary(request: Request):
     """Provide a one-shot AI summary of the entire timeline."""

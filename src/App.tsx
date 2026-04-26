@@ -30,6 +30,9 @@ import { cn } from './lib/utils';
 import { useGameSimulation } from './hooks/useGameSimulation';
 import { useAICompanion } from './hooks/useAICompanion';
 import { PetChatPanel } from './components/PetChatPanel';
+import { PipelineBuilder } from './components/PipelineBuilder';
+import { YouTubeLiveCompanionDemo } from './components/YouTubeLiveCompanionDemo';
+import { requestPipelineReaction } from './lib/pipelineClient';
 
 // --- Components ---
 
@@ -54,17 +57,27 @@ const ChatModal = ({ isOpen, onClose, activeSport }: { isOpen: boolean, onClose:
     setIsLoading(true);
 
     try {
-      const res = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ userMessage, activeSport })
+      const data = await requestPipelineReaction({
+        triggerReason: 'user_message',
+        userMessage,
+        activeSport,
+        persona: 'analyst',
+        gameContext: {
+          teams: `${activeSport} Demo`,
+          score: 'Pre-game',
+          clock: '00:00',
+          lastPlay: 'Marketing chat opened from the hero section.',
+          excitement: 0.4,
+        },
+        chatHistory: messages.map(msg => ({
+          role: msg.role === 'model' ? 'ai' : 'user',
+          content: msg.text,
+        })),
       });
-      const data = await res.json();
 
-      if (!res.ok || !data.text) throw new Error(data.error);
+      if (!data.output?.text) throw new Error('Pipeline returned no text');
 
-      const text = data.text;
-      setMessages(prev => [...prev, { role: 'model', text }]);
+      setMessages(prev => [...prev, { role: 'model', text: data.output.text }]);
     } catch (error) {
       console.error("Chat error:", error);
       setMessages(prev => [...prev, { role: 'model', text: "Whoops, I missed that play. What happened?" }]);
@@ -285,7 +298,6 @@ const InteractiveDemo = () => {
   const [isLive, setIsLive] = useState(false);
   const [historicalGames, setHistoricalGames] = useState<any[]>([]);
   const [isLoadingGames, setIsLoadingGames] = useState(true);
-  const [isChatModalOpen, setIsChatModalOpen] = useState(false);
 
   useEffect(() => {
     fetch('/api/games/historical')
@@ -347,12 +359,6 @@ const InteractiveDemo = () => {
 
   return (
     <div className="w-full max-w-6xl mx-auto flex flex-col gap-6">
-      <ChatModal
-        isOpen={isChatModalOpen}
-        onClose={() => setIsChatModalOpen(false)}
-        activeSport={activeSport}
-      />
-
       {/* Sport Selector */}
       <div className="flex justify-center gap-4">
         {(['NBA', 'CS2', 'LOL'] as const).map((sport) => (
@@ -737,238 +743,43 @@ const HowItWorksInteractive = () => {
   );
 };
 
+const WorkerFlowPage = () => (
+  <div className="min-h-screen selection:bg-brand-purple/30 px-6 py-8">
+    <div className="max-w-7xl mx-auto flex flex-col gap-6">
+      <header className="glass-dark rounded-[2rem] border border-white/10 p-6 flex flex-col md:flex-row md:items-center justify-between gap-4">
+        <div>
+          <p className="text-[10px] font-bold uppercase tracking-widest text-brand-purple">内部工作人员页面</p>
+          <h1 className="text-3xl md:text-5xl font-bold tracking-tight mt-2">模型流程编辑器</h1>
+          <p className="mt-3 max-w-2xl text-sm text-white/50 leading-relaxed">
+            用来给团队配置输入端大模型、结构化上下文、输出端大模型和数字人服务的内部流程图。
+            这个页面和面向客户的 VStandby Studio 首页是分开的。
+          </p>
+        </div>
+        <a
+          href="/"
+          className="self-start md:self-center glass px-5 py-3 rounded-full text-xs font-bold uppercase tracking-widest text-white/60 hover:text-white hover:bg-white/10 transition-colors"
+        >
+          返回客户页
+        </a>
+      </header>
+
+      <PipelineBuilder />
+    </div>
+  </div>
+);
+
 export default function App() {
-  const [isDemoModalOpen, setIsDemoModalOpen] = useState(false);
-  const [activeSport, setActiveSport] = useState('NBA');
+  const isWorkerFlow =
+    typeof window !== 'undefined' &&
+    ['/BETA2026_workflow', '/worker-flow', '/flow-builder', '/internal-flow'].includes(window.location.pathname);
+
+  if (isWorkerFlow) {
+    return <WorkerFlowPage />;
+  }
 
   return (
-    <div className="min-h-screen selection:bg-brand-purple/30">
-      <Navbar />
-      <ChatModal
-        isOpen={isDemoModalOpen}
-        onClose={() => setIsDemoModalOpen(false)}
-        activeSport={activeSport}
-      />
-
-      {/* Hero Section */}
-      <section className="relative pt-32 pb-20 px-6 overflow-hidden">
-        <div className="absolute top-0 left-1/2 -translate-x-1/2 w-full max-w-7xl h-[600px] bg-glow opacity-50 pointer-events-none" />
-
-        <div className="max-w-7xl mx-auto text-center relative z-10">
-          <motion.div
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.8 }}
-          >
-            <span className="inline-block px-4 py-1.5 rounded-full glass text-xs font-bold tracking-widest uppercase text-brand-purple mb-6">
-              The Future of Sports Watching
-            </span>
-            <h1 className="text-5xl md:text-8xl font-bold tracking-tighter mb-8 leading-[0.9] text-gradient">
-              Your AI Companion <br /> For Every Game
-            </h1>
-            <p className="text-lg md:text-xl text-white/60 max-w-2xl mx-auto mb-10 leading-relaxed">
-              Watch games together with your AI. Get live reactions, insights, and predictions in real-time. <br className="hidden md:block" />
-              Never watch alone again.
-            </p>
-
-            <div className="flex flex-col sm:flex-row items-center justify-center gap-4">
-              <button
-                onClick={() => setIsDemoModalOpen(true)}
-                className="w-full sm:w-auto px-8 py-4 rounded-full bg-brand-purple text-white font-bold hover:scale-105 transition-transform shadow-xl shadow-brand-purple/20"
-              >
-                Start Watching Together
-              </button>
-              <button
-                onClick={() => {
-                  const el = document.getElementById('how-it-works');
-                  el?.scrollIntoView({ behavior: 'smooth' });
-                }}
-                className="w-full sm:w-auto px-8 py-4 rounded-full glass text-white font-bold hover:bg-white/10 transition-colors flex items-center justify-center gap-2"
-              >
-                <Play className="w-4 h-4 fill-current" />
-                See How It Works
-              </button>
-            </div>
-          </motion.div>
-
-          <motion.div
-            initial={{ opacity: 0, y: 40 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: 0.4, duration: 1 }}
-            className="mt-20 relative"
-          >
-            <div className="absolute -inset-4 bg-gradient-to-b from-brand-purple/20 to-transparent blur-3xl opacity-30" />
-            <div className="relative glass-dark rounded-[2rem] p-4 border border-white/10 shadow-2xl animate-float">
-              <img
-                src="/premium_companion_overlay.png"
-                alt="Overlay Mockup"
-                className="w-full aspect-[2/1] object-cover object-center rounded-2xl opacity-40"
-                referrerPolicy="no-referrer"
-              />
-              <div className="absolute inset-0 flex items-center justify-center">
-                <div className="glass p-6 rounded-3xl max-w-md text-left border-brand-purple/30">
-                  <div className="flex items-center gap-3 mb-4">
-                    <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-                    <span className="text-xs font-bold uppercase tracking-widest text-emerald-400">Watching With You</span>
-                  </div>
-                  <p className="text-sm text-white/80 mb-4">"This game is starting to swing toward the Lakers."</p>
-                  <div className="flex gap-2">
-                    <div className="px-3 py-1 rounded-full bg-brand-purple/20 text-brand-purple text-[10px] font-bold">MOMENTUM SHIFT</div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </motion.div>
-        </div>
-      </section>
-
-      {/* Features Section */}
-      <section id="features" className="py-24 px-6 bg-black/50">
-        <div className="max-w-7xl mx-auto">
-          <div className="text-center mb-20">
-            <h2 className="text-3xl md:text-5xl font-bold mb-6 tracking-tight">Intelligence in Every Frame</h2>
-            <p className="text-white/50 max-w-xl mx-auto">Our neural engine processes thousands of data points per second to give you the edge.</p>
-          </div>
-
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-            <FeatureCard
-              icon={MessageSquare}
-              title="Live Reactions"
-              description="Your AI friend reacts to every play, bad call, and miracle shot just like you do."
-              delay={0.1}
-            />
-            <FeatureCard
-              icon={Brain}
-              title="Smart Predictions"
-              description="Know what's coming next. From pick-and-rolls to site executes, your companion sees it all."
-              delay={0.2}
-            />
-            <FeatureCard
-              icon={Zap}
-              title="Instant Insights"
-              description="No heavy data, just the stuff that matters. Simple, conversational context for every moment."
-              delay={0.3}
-            />
-            <FeatureCard
-              icon={Globe}
-              title="Watch Together"
-              description="Connect your favorite stream and never watch a game alone again. It's like a watch party in your pocket."
-              delay={0.4}
-            />
-            <FeatureCard
-              icon={TrendingUp}
-              title="Game Momentum"
-              description="Feel the shift in the game. Your AI tracks the 'vibe' and tells you when the tide is turning."
-              delay={0.5}
-            />
-            <FeatureCard
-              icon={Shield}
-              title="Always By Your Side"
-              description="A companion that learns your favorite teams and players to provide a personalized experience."
-              delay={0.6}
-            />
-          </div>
-        </div>
-      </section>
-
-      {/* Interactive Demo Section */}
-      <section id="product" className="py-24 px-6 relative overflow-hidden">
-        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-full h-full bg-glow opacity-20 pointer-events-none" />
-        <div className="max-w-7xl mx-auto relative z-10">
-          <div className="text-center mb-16">
-            <h2 className="text-3xl md:text-5xl font-bold mb-6 tracking-tight">Experience the Overlay</h2>
-            <p className="text-white/50 max-w-xl mx-auto">Interact with our simulated live feed to see VStandby in action.</p>
-          </div>
-
-          <InteractiveDemo />
-        </div>
-      </section>
-
-      {/* How It Works */}
-      <section id="how-it-works" className="py-24 px-6">
-        <div className="max-w-7xl mx-auto">
-          <div className="text-center mb-20">
-            <h2 className="text-3xl md:text-5xl font-bold mb-6 tracking-tight">How It Works</h2>
-            <p className="text-white/50 max-w-xl mx-auto">Three simple steps to never watch a game alone again.</p>
-          </div>
-          <HowItWorksInteractive />
-        </div>
-      </section>
-
-      {/* Use Cases */}
-      <section className="py-24 px-6 bg-white/5">
-        <div className="max-w-7xl mx-auto">
-          <h2 className="text-3xl md:text-5xl font-bold mb-16 text-center tracking-tight">Built for Every Fan</h2>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            {[
-              { label: "Sports Fans", icon: Globe },
-              { label: "Fantasy Players", icon: Target },
-              { label: "Esports Viewers", icon: Cpu },
-              { label: "Sports Investors", icon: TrendingUp }
-            ].map((item, idx) => (
-              <div key={idx} className="glass p-8 rounded-3xl text-center hover:bg-white/10 transition-colors cursor-default">
-                <item.icon className="w-8 h-8 mx-auto mb-4 text-brand-purple" />
-                <span className="font-bold text-sm uppercase tracking-widest">{item.label}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      </section>
-
-      {/* Vision Section */}
-      <section id="vision" className="py-32 px-6 text-center">
-        <div className="max-w-3xl mx-auto">
-          <motion.div
-            initial={{ opacity: 0, scale: 0.9 }}
-            whileInView={{ opacity: 1, scale: 1 }}
-            viewport={{ once: true }}
-          >
-            <h2 className="text-4xl md:text-6xl font-bold mb-8 tracking-tighter">The Future of Intelligence</h2>
-            <p className="text-xl text-white/60 leading-relaxed mb-12">
-              We are building the future of sports intelligence — where every fan has access to elite-level analysis in real time. Our mission is to democratize data and empower viewers with the same tools used by professional analysts.
-            </p>
-            <div className="w-20 h-1 bg-brand-purple mx-auto rounded-full" />
-          </motion.div>
-        </div>
-      </section>
-
-      {/* CTA Section */}
-      <section className="py-24 px-6">
-        <div className="max-w-5xl mx-auto glass-dark rounded-[3rem] p-12 md:p-20 text-center relative overflow-hidden border border-white/10">
-          <div className="absolute inset-0 bg-glow opacity-30 pointer-events-none" />
-          <div className="relative z-10">
-            <h2 className="text-4xl md:text-7xl font-bold mb-8 tracking-tighter leading-none">Never Watch <br /> Blind Again</h2>
-            <p className="text-lg text-white/50 mb-12 max-w-xl mx-auto">Join the waitlist for early access to the VStandby Studio private beta.</p>
-            <div className="flex flex-col sm:flex-row items-center justify-center gap-4">
-              <input
-                type="email"
-                placeholder="Enter your email"
-                className="w-full sm:w-80 h-14 rounded-full bg-white/5 border border-white/10 px-6 focus:outline-none focus:border-brand-purple transition-colors"
-              />
-              <button className="w-full sm:w-auto h-14 px-10 rounded-full bg-white text-black font-bold hover:bg-white/90 transition-colors">
-                Join Waitlist
-              </button>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      {/* Footer */}
-      <footer className="py-12 px-6 border-t border-white/5">
-        <div className="max-w-7xl mx-auto flex flex-col md:row items-center justify-between gap-8">
-          <div className="flex items-center gap-2">
-            <Activity className="w-5 h-5 text-brand-purple" />
-            <span className="text-lg font-bold tracking-tighter">VStandby <span className="text-brand-purple">Studio</span></span>
-          </div>
-          <div className="flex gap-8 text-sm text-white/40">
-            <a href="#" className="hover:text-white transition-colors">Privacy Policy</a>
-            <a href="#" className="hover:text-white transition-colors">Terms of Service</a>
-            <a href="#" className="hover:text-white transition-colors">Twitter</a>
-            <a href="#" className="hover:text-white transition-colors">Discord</a>
-          </div>
-          <p className="text-xs text-white/20">© 2026 VStandby Studio. All rights reserved.</p>
-        </div>
-      </footer>
-    </div>
+    <main className="min-h-screen bg-brand-dark px-4 py-4 selection:bg-brand-purple/30">
+      <YouTubeLiveCompanionDemo />
+    </main>
   );
 }
