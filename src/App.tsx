@@ -778,7 +778,7 @@ export default function App() {
   }
 
   return (
-    <main className="min-h-screen bg-brand-dark px-4 py-4 selection:bg-brand-purple/30">
+    <main className="min-h-screen bg-white px-4 py-4 selection:bg-brand-purple/30">
       <YouTubeLiveCompanionDemo />
     </main>
   );
