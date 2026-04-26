@@ -24,12 +24,12 @@ export interface VisionCompanionOptions {
 }
 
 // Perception loop tuning ------------------------------------------------------
-const FRAME_SAMPLE_INTERVAL_MS = 2500; // capture a frame every ~2.5s
-const FRAME_BUFFER_SIZE = 4; // keep the last N frames in memory
-const SCENE_CHANGE_THRESHOLD = 0.12; // fingerprintDiff above this ⇒ visual event
-const VISUAL_EVENT_COOLDOWN_MS = 10_000; // per-trigger cooldown
-const SCORE_EVENT_COOLDOWN_MS = 8_000;
-const IDLE_CHECK_INTERVAL_MS = 5_000;
+const FRAME_SAMPLE_INTERVAL_MS = 800; // faster polling (0.8s) for low latency
+const FRAME_BUFFER_SIZE = 5; // keep the last N frames in memory
+const SCENE_CHANGE_THRESHOLD = 0.08; // more sensitive to visual events
+const VISUAL_EVENT_COOLDOWN_MS = 5_000; // react more often
+const SCORE_EVENT_COOLDOWN_MS = 5_000;
+const IDLE_CHECK_INTERVAL_MS = 3_000;
 const IDLE_BREAK_AFTER_MS = 28_000; // silence this long while watching ⇒ say something
 
 export function useAICompanion(
@@ -64,26 +64,36 @@ export function useAICompanion(
   const visionEnabled = vision?.enabled ?? false;
   const videoRef = vision?.videoRef;
 
+  const isPlayingRef = useRef(false);
+  const audioQueueRef = useRef<string[]>([]);
+
   const stopSpeaking = () => {
     if (currentAudioRef.current) {
       currentAudioRef.current.pause();
       currentAudioRef.current.currentTime = 0;
       currentAudioRef.current = null;
     }
+    audioQueueRef.current = [];
+    isPlayingRef.current = false;
     setIsSpeaking(false);
   };
 
-  const playVoice = async (text: string) => {
-    if (!isVoiceEnabled) return;
+  const playNextInQueue = async () => {
+    if (isPlayingRef.current || audioQueueRef.current.length === 0) return;
+    isPlayingRef.current = true;
+    const text = audioQueueRef.current.shift()!;
+    
     try {
-      stopSpeaking();
-
       const res = await fetch('/api/tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text })
       });
-      if (!res.ok) return;
+      if (!res.ok) {
+        isPlayingRef.current = false;
+        playNextInQueue();
+        return;
+      }
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const audio = new Audio(url);
@@ -105,12 +115,22 @@ export function useAICompanion(
         setIsSpeaking(false);
         currentAudioRef.current = null;
         source.disconnect();
+        isPlayingRef.current = false;
+        playNextInQueue();
       };
 
       audio.play();
     } catch (e) {
       console.error('Failed to play TTS:', e);
+      isPlayingRef.current = false;
+      playNextInQueue();
     }
+  };
+
+  const queueVoice = (text: string) => {
+    if (!isVoiceEnabled || !text.trim()) return;
+    audioQueueRef.current.push(text);
+    playNextInQueue();
   };
 
   // ---------------------------------------------------------------------------
@@ -226,14 +246,26 @@ export function useAICompanion(
       setMessages(prev => [...prev, { id: aiMsgId, role: 'ai', content: '' }]);
 
       let fullText = '';
+      let processedLength = 0;
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
         fullText += decoder.decode(value, { stream: true });
+        
+        const unprocessed = fullText.slice(processedLength);
+        const match = unprocessed.match(/[^.!?]+[.!?]+/g);
+        if (match) {
+            for (const sentence of match) {
+                queueVoice(sentence.trim());
+                processedLength += sentence.length;
+            }
+        }
+        
         setMessages(prev => prev.map(m => m.id === aiMsgId ? { ...m, content: fullText } : m));
       }
 
-      if (fullText.trim()) playVoice(fullText);
+      const remainder = fullText.slice(processedLength).trim();
+      if (remainder) queueVoice(remainder);
       // Visual/score events put us in "waiting for user" mode so we don't
       // talk over ourselves. Idle breaks don't — they're self-gated.
       if (reason === 'visual_event' || reason === 'score_change') {
@@ -298,14 +330,26 @@ export function useAICompanion(
         setMessages(prev => [...prev, { id: aiMsgId, role: 'ai', content: '' }]);
 
         let fullText = '';
+        let processedLength = 0;
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
           fullText += decoder.decode(value, { stream: true });
+          
+          const unprocessed = fullText.slice(processedLength);
+          const match = unprocessed.match(/[^.!?]+[.!?]+/g);
+          if (match) {
+              for (const sentence of match) {
+                  queueVoice(sentence.trim());
+                  processedLength += sentence.length;
+              }
+          }
+          
           setMessages(prev => prev.map(m => m.id === aiMsgId ? { ...m, content: fullText } : m));
         }
 
-        playVoice(fullText);
+        const remainder = fullText.slice(processedLength).trim();
+        if (remainder) queueVoice(remainder);
         waitingForUserRef.current = true;
       } catch (error) {
         console.error("Auto broadcast skipped:", error);
@@ -361,16 +405,29 @@ export function useAICompanion(
       setMessages(prev => [...prev, { id: aiMsgId, role: 'ai', content: '' }]);
 
       let fullText = '';
+      let processedLength = 0;
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
         fullText += decoder.decode(value, { stream: true });
+        
+        const unprocessed = fullText.slice(processedLength);
+        const match = unprocessed.match(/[^.!?]+[.!?]+/g);
+        if (match) {
+            for (const sentence of match) {
+                queueVoice(sentence.trim());
+                processedLength += sentence.length;
+            }
+        }
+        
         setMessages(prev => prev.map(m => m.id === aiMsgId ? { ...m, content: fullText } : m));
       }
 
+      const remainder = fullText.slice(processedLength).trim();
+      if (remainder) queueVoice(remainder);
+
       // User-triggered → reset cooldown so the AI doesn't immediately fire another proactive broadcast.
       lastBroadcastTime.current = Date.now();
-      playVoice(fullText);
     } catch (error) {
       console.error(error);
       const errorMsg: ChatMessage = { id: (Date.now() + 1).toString(), role: 'ai', content: 'Connection issue. I missed that, sorry!' };
@@ -405,13 +462,26 @@ export function useAICompanion(
        setMessages(prev => [...prev, { id: aiMsgId, role: 'ai', content: '' }]);
 
        let fullText = '';
+       let processedLength = 0;
        while (true) {
          const {done, value} = await reader.read();
          if(done) break;
          fullText += decoder.decode(value, {stream: true});
+         
+         const unprocessed = fullText.slice(processedLength);
+         const match = unprocessed.match(/[^.!?]+[.!?]+/g);
+         if (match) {
+             for (const sentence of match) {
+                 queueVoice(sentence.trim());
+                 processedLength += sentence.length;
+             }
+         }
+         
          setMessages(prev => prev.map(m => m.id === aiMsgId ? { ...m, content: fullText } : m));
        }
-       playVoice(fullText);
+       
+       const remainder = fullText.slice(processedLength).trim();
+       if (remainder) queueVoice(remainder);
      } catch (e) {
         console.error(e);
      } finally {
@@ -459,7 +529,7 @@ export function useAICompanion(
       lastVisionTimestamp.current = nextComment.timestamp;
       const aiMsgId = Date.now().toString();
       setMessages(prev => [...prev, { id: aiMsgId, role: 'ai', content: nextComment.comment }]);
-      playVoice(nextComment.comment);
+      queueVoice(nextComment.comment);
     }
   };
 

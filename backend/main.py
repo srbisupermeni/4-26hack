@@ -323,19 +323,26 @@ async def chat_summary(request: Request):
             "Provide a robust, 3-4 sentence game outcome summary in your pure persona! Do not greet. Just react to the ending and wrap up the game!"
         )
         
-        client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        from google import genai
+        from google.genai import types
+        
+        client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+        
+        config = types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            temperature=0.7,
+        )
         
         async def generate_summary_stream():
             try:
-                response = await client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role": "system", "content": system_prompt}],
-                    stream=True,
-                    timeout=10.0
+                response_stream = await client.aio.models.generate_content_stream(
+                    model="gemini-2.5-flash",
+                    contents="Summarize the game.",
+                    config=config,
                 )
-                async for chunk in response:
-                    if chunk.choices[0].delta.content:
-                        yield chunk.choices[0].delta.content
+                async for chunk in response_stream:
+                    if chunk.text:
+                        yield chunk.text
             except Exception as e:
                 yield f"Connection disrupted! ({str(e)[:80]}...)"
                 
@@ -354,7 +361,6 @@ async def chat(request: Request):
         
     user_message = data.get("userMessage", "")
     chat_history = data.get("chatHistory", [])
-    game_context = data.get("gameContext", {})
     is_auto = data.get("isAutoBroadcast", False)
     persona = data.get("persona", "analyst")
     active_sport = data.get("activeSport", "NBA")
@@ -370,45 +376,63 @@ async def chat(request: Request):
     system_prompt = (
         f"{persona_prompt}\n"
         f"You are sitting next to the user watching the {active_sport} game together.\n"
-        f"Right now, the TV shows: Score {game_context.get('score', '0 - 0')}, Clock {game_context.get('clock', '00:00')}, Last play '{game_context.get('lastPlay', 'System starting...')}'.\n"
         "If the user asks you questions or wants to chit-chat, respond naturally about ANY topic but strictly stay fully locked into your assigned persona. "
-        "Do NOT constantly mention the 'System starting...' status if the user is just chatting. "
         "Keep responses very casual, punchy, and short (1 or 2 sentences max)."
     )
 
     if is_auto:
-        system_prompt += f"\n\nYou are auto-reacting immediately to this new play: {game_context.get('lastPlay')}\nKeep it to exactly 1 short sentence staying entirely in your persona! Do NOT greet the user!"
+        system_prompt += f"\n\nYou are auto-reacting immediately to a new play. Keep it to exactly 1 short sentence staying entirely in your persona! Do NOT greet the user!"
 
-    messages = [{"role": "system", "content": system_prompt}]
+    from google import genai
+    from google.genai import types
+    
+    client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+    
+    contents = []
     
     # Add history
     for msg in chat_history:
-        role = "assistant" if msg.get("role") == "ai" else "user"
-        content = msg.get("content", "").strip()
-        if content:
-            messages.append({"role": role, "content": content})
+        role = "model" if msg.get("role") == "ai" else "user"
+        content_str = msg.get("content", "").strip()
+        if content_str:
+            contents.append(types.Content(role=role, parts=[types.Part.from_text(text=content_str)]))
             
     # Add the current message if not auto broadcast
     if user_message and not is_auto:
-        # If chat_history already includes this last user message, we shouldn't append it again
-        # The frontend appends the user message to history before calling the API, 
-        # so let's check if the last message in history is the same.
         if not chat_history or chat_history[-1].get("content") != user_message:
-            messages.append({"role": "user", "content": user_message})
+            contents.append(types.Content(role="user", parts=[types.Part.from_text(text=user_message)]))
+            
+    if is_auto and len(contents) == 0:
+        contents.append(types.Content(role="user", parts=[types.Part.from_text(text="[AUTO EVENT] React to the play")]))
 
-    client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    # Clean contents for Gemini rules
+    cleaned_contents = []
+    for c in contents:
+        if cleaned_contents and cleaned_contents[-1].role == c.role:
+            cleaned_contents[-1].parts.extend(c.parts)
+        else:
+            cleaned_contents.append(c)
+    if cleaned_contents and cleaned_contents[0].role == "model":
+        cleaned_contents.pop(0)
+    if not cleaned_contents:
+        cleaned_contents.append(types.Content(role="user", parts=[types.Part.from_text(text="Hello.")]))
+
+    config = types.GenerateContentConfig(
+        system_instruction=system_prompt,
+        temperature=0.7,
+        max_output_tokens=150,
+    )
 
     async def generate_stream():
         try:
-            response = await client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=messages,
-                stream=True,
-                timeout=10.0
+            response_stream = await client.aio.models.generate_content_stream(
+                model="gemini-2.5-flash",
+                contents=cleaned_contents,
+                config=config,
             )
-            async for chunk in response:
-                if chunk.choices[0].delta.content:
-                    yield chunk.choices[0].delta.content
+            async for chunk in response_stream:
+                if chunk.text:
+                    yield chunk.text
         except Exception as e:
             err_str = str(e)
             yield f"Connection disrupted! (System details: {err_str[:80]}...)"
@@ -417,17 +441,6 @@ async def chat(request: Request):
 
 @app.post("/api/chat/vision")
 async def chat_vision(request: Request):
-    """Vision-aware companion chat.
-
-    Accepts the same payload shape as /api/chat plus a `frames` list of
-    JPEG data URLs captured from the user's playing video (last 1~3 frames).
-
-    Supports four trigger modes via `triggerReason`:
-      - user_message       → user typed something; respond conversationally.
-      - visual_event       → client detected a big scene change; react proactively.
-      - score_change       → NBA API score bumped; react to the play.
-      - idle_break         → long silence; gentle check-in / light commentary.
-    """
     try:
         data = await request.json()
     except Exception:
@@ -435,13 +448,12 @@ async def chat_vision(request: Request):
 
     user_message = data.get("userMessage", "") or ""
     chat_history = data.get("chatHistory", []) or []
-    game_context = data.get("gameContext", {}) or {}
     persona = data.get("persona", "analyst")
     active_sport = data.get("activeSport", "NBA")
     trigger_reason = data.get("triggerReason", "user_message")
     frames = data.get("frames", []) or []
 
-    # Cap frame count & size server-side too (defense in depth against huge payloads).
+    # Cap frames
     if len(frames) > 3:
         frames = frames[-3:]
 
@@ -454,25 +466,19 @@ async def chat_vision(request: Request):
 
     system_prompt = (
         f"{persona_prompt}\n"
-        f"You are sitting next to the user watching a {active_sport} video together.\n"
-        "You can actually SEE the video right now — the user-attached images are recent frames from what you're both watching.\n"
-        "Ground your reactions in what's visible in the frames. If the frames contradict the text score/state, trust the frames.\n"
-        f"Auxiliary text state from the scoreboard: Score {game_context.get('score', 'unknown')}, "
-        f"Clock {game_context.get('clock', 'unknown')}, Last play '{game_context.get('lastPlay', 'n/a')}'.\n"
-        "Stay fully locked into your assigned persona. Keep responses punchy and short (1~2 sentences max). "
+        f"You are sitting next to the user watching a {active_sport} video closely.\n"
+        "You rely PURELY on the visual frames provided to you. Do NOT hallucinate an invisible game score; just read the visuals.\n"
+        "Look CAREFULLY at the UI elements (scores, player health bars, minimap, shot clock, kill feed, etc.), player movement, and specific events in the frames.\n"
+        "Point out specific actions (e.g. 'He just missed the 3-pointer!' or 'That ultimate ability missed!') rather than giving generic hype.\n"
+        "Ground your reactions in what's literally visible in the frames.\n"
+        "Stay fully locked into your assigned persona. Keep responses punchy and short (1-2 sentences max). "
         "Talk like a friend on the couch, not a broadcaster. No greetings, no preamble."
     )
 
-    # Per-trigger nudge.
-    if trigger_reason == "visual_event":
+    if trigger_reason == "visual_event" or trigger_reason == "score_change":
         system_prompt += (
             "\n\nThe picture just changed significantly — react immediately to what you see "
             "in the most recent frame. 1 short sentence only, in pure persona."
-        )
-    elif trigger_reason == "score_change":
-        system_prompt += (
-            f"\n\nThe score just changed to {game_context.get('score')}. React to the play "
-            f"('{game_context.get('lastPlay')}') in 1 short sentence, pure persona."
         )
     elif trigger_reason == "idle_break":
         system_prompt += (
@@ -480,62 +486,83 @@ async def chat_vision(request: Request):
             "what's on screen — don't force hype if nothing's happening."
         )
 
-    # Build OpenAI multimodal messages.
-    messages = [{"role": "system", "content": system_prompt}]
+    from google import genai
+    from google.genai import types
+    import base64
+
+    client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+
+    contents = []
 
     for msg in chat_history:
-        role = "assistant" if msg.get("role") == "ai" else "user"
-        content = (msg.get("content") or "").strip()
-        if content:
-            messages.append({"role": role, "content": content})
+        role = "model" if msg.get("role") == "ai" else "user"
+        content_str = (msg.get("content") or "").strip()
+        if content_str:
+            contents.append(types.Content(role=role, parts=[types.Part.from_text(text=content_str)]))
 
-    # Final user turn: text + image attachments.
-    user_content: list = []
-    if trigger_reason == "user_message" and user_message:
-        user_content.append({"type": "text", "text": user_message})
-    elif trigger_reason == "visual_event":
-        user_content.append({"type": "text", "text": "[VISUAL EVENT] React to what's on screen now."})
-    elif trigger_reason == "score_change":
-        user_content.append({
-            "type": "text",
-            "text": f"[SCORE EVENT] {game_context.get('lastPlay', '')}",
-        })
+    user_parts = []
+    
+    prompt_text = user_message or "React to the current scene."
+    if trigger_reason == "visual_event" or trigger_reason == "score_change":
+        prompt_text = "[VISUAL EVENT] React to what's on screen now."
     elif trigger_reason == "idle_break":
-        user_content.append({"type": "text", "text": "[IDLE] Offer a light observation on the current scene."})
-    else:
-        user_content.append({"type": "text", "text": user_message or "React to the current scene."})
+        prompt_text = "[IDLE] Offer a light observation on the current scene."
+    
+    user_parts.append(types.Part.from_text(text=prompt_text))
 
     for frame_data_url in frames:
-        if not isinstance(frame_data_url, str):
+        if not isinstance(frame_data_url, str) or not frame_data_url.startswith("data:image/"):
             continue
-        if not frame_data_url.startswith("data:image/"):
-            continue
-        user_content.append({
-            "type": "image_url",
-            "image_url": {"url": frame_data_url, "detail": "low"},
-        })
+        try:
+            header, encoded = frame_data_url.split(",", 1)
+            mime_type = header.split(":")[1].split(";")[0]
+            img_bytes = base64.b64decode(encoded)
+            user_parts.append(types.Part.from_bytes(data=img_bytes, mime_type=mime_type))
+        except Exception as e:
+            print(f"Error decoding image: {e}")
 
-    messages.append({"role": "user", "content": user_content})
+    contents.append(types.Content(role="user", parts=user_parts))
+    
+    # ---------------------------------------------
+    # Format contents for Gemini strict role rules:
+    # 1. Must start with 'user'
+    # 2. Roles must strictly alternate
+    # ---------------------------------------------
+    cleaned_contents = []
+    for c in contents:
+        if cleaned_contents and cleaned_contents[-1].role == c.role:
+            cleaned_contents[-1].parts.extend(c.parts)
+        else:
+            cleaned_contents.append(c)
+    
+    if cleaned_contents and cleaned_contents[0].role == "model":
+        cleaned_contents.pop(0)
+    
+    if not cleaned_contents:
+        cleaned_contents.append(types.Content(role="user", parts=[types.Part.from_text(text="Hello.")]))
 
-    client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    config = types.GenerateContentConfig(
+        system_instruction=system_prompt,
+        temperature=0.7,
+        max_output_tokens=150,
+    )
 
     async def generate_stream():
         try:
-            response = await client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=messages,
-                stream=True,
-                timeout=15.0,
-                max_tokens=120,
+            response_stream = await client.aio.models.generate_content_stream(
+                model="gemini-2.5-flash",
+                contents=cleaned_contents,
+                config=config,
             )
-            async for chunk in response:
-                if chunk.choices[0].delta.content:
-                    yield chunk.choices[0].delta.content
+            async for chunk in response_stream:
+                if chunk.text:
+                    yield chunk.text
         except Exception as e:
             err_str = str(e)
             yield f"Connection disrupted! (Vision: {err_str[:80]}...)"
 
     return StreamingResponse(generate_stream(), media_type="text/plain; charset=utf-8")
+
 
 
 @app.post("/api/tts")
