@@ -4,7 +4,7 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "concurrently \"python -m uvicorn backend.main:app --port 8000 --reload\" \"vite\"",
+    "dev": "concurrently \"python3 -m uvicorn backend.main:app --port 8000 --reload\" \"vite\"",
     "build": "vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist",
