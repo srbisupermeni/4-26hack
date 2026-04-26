@@ -1,0 +1,79 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --color-brand-purple: #7c3aed;
+  --color-brand-blue: #0ea5e9;
+  --color-brand-dark: #050505;
+}
+
+@layer base {
+  body {
+    @apply bg-brand-dark text-white antialiased selection:bg-brand-purple/30;
+    font-family: var(--font-sans);
+  }
+}
+
+@layer utilities {
+  .glass {
+    @apply bg-white/5 backdrop-blur-xl border border-white/10;
+  }
+  
+  .glass-dark {
+    @apply bg-black/40 backdrop-blur-2xl border border-white/5;
+  }
+
+  .text-gradient {
+    @apply bg-clip-text text-transparent bg-gradient-to-r from-white via-white to-white/50;
+  }
+
+  .bg-glow {
+    background: radial-gradient(circle at 50% 50%, rgba(124, 58, 237, 0.15) 0%, transparent 70%);
+  }
+}
+
+@keyframes float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-10px); }
+}
+
+.animate-float {
+  animation: float 6s ease-in-out infinite;
+}
+
+/* ── Pet avatar animations ── */
+@keyframes pet-idle-float {
+  0%, 100% { transform: translateY(0); }
+  50%       { transform: translateY(-8px); }
+}
+.pet-idle { animation: pet-idle-float 3s ease-in-out infinite; }
+
+@keyframes pet-listen-pulse {
+  0%, 100% { transform: scale(1); }
+  50%       { transform: scale(1.06); }
+}
+.pet-listening { animation: pet-listen-pulse 0.8s ease-in-out infinite; }
+
+@keyframes pet-spin-wobble {
+  0%   { transform: rotate(-4deg); }
+  50%  { transform: rotate(4deg); }
+  100% { transform: rotate(-4deg); }
+}
+.pet-thinking { animation: pet-spin-wobble 1s linear infinite; }
+
+@keyframes pet-talk-float {
+  0%, 100% { transform: translateY(0); }
+  50%       { transform: translateY(-4px); }
+}
+.pet-talking { animation: pet-talk-float 0.5s ease-in-out infinite; }
+
+.pet-eye-lid {
+  transform-origin: center;
+  animation: pet-blink 4s ease-in-out infinite;
+}
+@keyframes pet-blink {
+  0%, 94%, 100% { transform: scaleY(1); }
+  96%           { transform: scaleY(0.05); }
+}
+
+.pet-mouth { transition: d 0.15s ease; }

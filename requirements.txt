@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+nba_api
+python-multipart
+google-genai
+python-dotenv
+requests
+openai
