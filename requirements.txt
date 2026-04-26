@@ -6,3 +6,5 @@ google-genai
 python-dotenv
 requests
 openai
+opencv-python
+numpy

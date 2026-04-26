@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Activity, Bot, Link, Loader2, Radio, Send } from 'lucide-react';
 import { cn } from '../lib/utils';
+import SpatialRealAvatar from './SpatialRealAvatar';
 
 declare global {
   interface Window {
@@ -228,18 +229,15 @@ export function YouTubeLiveCompanionDemo() {
           <div className="h-12 px-5 border-b border-white/10 flex items-center justify-between">
             <div>
               <p className="text-[10px] font-bold uppercase tracking-widest text-brand-purple">数字人陪伴</p>
-              <p className="text-xs text-white/35">先占位，后续接语音/表情/动作</p>
+              <p className="text-xs text-white/35">SpatialReal 数字人</p>
             </div>
             <Bot className="w-5 h-5 text-brand-purple" />
           </div>
-          <div className="flex-1 flex flex-col items-center justify-center text-center p-8">
-            <div className="w-28 h-28 rounded-full border border-brand-purple/30 bg-brand-purple/10 flex items-center justify-center mb-6">
-              <Bot className="w-12 h-12 text-brand-purple" />
-            </div>
-            <h3 className="text-2xl font-bold mb-3">数字人准备中</h3>
-            <p className="text-sm text-white/45 leading-relaxed max-w-xs">
-              这里会播放数字人的实时反应。当前先保留黑屏占位，后续接入预生成话术、TTS 和数字人渲染服务。
-            </p>
+          <div className="flex-1 flex flex-col items-center justify-center text-center p-6">
+            <SpatialRealAvatar
+              avatarWidth={300}
+              avatarHeight={400}
+            />
           </div>
         </div>
       </div>

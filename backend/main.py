@@ -1,7 +1,8 @@
 import os
 import random
 import asyncio
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, UploadFile, File
+import time
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.responses import StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 # from google import genai (Moved to lazy loading inside endpoint)
@@ -11,8 +12,10 @@ from dotenv import load_dotenv
 
 try:
     import historical_games
+    from motion_frames import extract_motion_frames
 except ImportError:
     from . import historical_games
+    from .motion_frames import extract_motion_frames
 
 load_dotenv('.env.local')
 load_dotenv()
@@ -697,6 +700,34 @@ async def chat_vision(request: Request):
     return StreamingResponse(generate_stream(), media_type="text/plain; charset=utf-8")
 
 
+@app.get("/api/session-token")
+async def get_session_token():
+    """Issue a short-lived SpatialReal session token for the browser avatar."""
+    api_key = os.getenv("SPATIALREAL_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="SPATIALREAL_API_KEY not set")
+
+    expire_at = int(time.time()) + 3600
+
+    def fetch_token():
+        import requests as req
+
+        response = req.post(
+            "https://console.us-west.spatialwalk.cloud/v1/console/session-tokens",
+            headers={"X-Api-Key": api_key, "Content-Type": "application/json"},
+            json={"expireAt": expire_at, "modelVersion": ""},
+            timeout=10,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    try:
+        data = await asyncio.to_thread(fetch_token)
+        return {"sessionToken": data["sessionToken"]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"SpatialReal token error: {str(e)}")
+
+
 
 @app.post("/api/tts")
 async def fetch_tts(request: Request):
@@ -777,3 +808,61 @@ async def analyze_video_vision(file: UploadFile = File(...), persona: str = "ana
     except Exception as e:
         print(f"Vision Error: {e}")
         return {"error": str(e)}
+
+
+@app.post("/api/vision/motion-frames")
+async def extract_motion_frames_endpoint(
+    file: UploadFile = File(...),
+    motion_threshold: float = 0.75,
+    cooldown_seconds: float = 0.2,
+    max_frames: int = 25,
+):
+    """Extract high-motion screenshots with OpenCV.
+
+    This is the backend hook for the left-line OpenCV stage. For now it accepts
+    uploaded clips; live YouTube/DVR support needs a backend stream URL or ring
+    buffer because browser iframes do not expose frames to OpenCV.
+    """
+    import tempfile
+
+    suffix = os.path.splitext(file.filename or "upload.mp4")[1] or ".mp4"
+    temp_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+            temp_path = temp_file.name
+            temp_file.write(await file.read())
+
+        frames = extract_motion_frames(
+            temp_path,
+            pixel_diff_threshold=25,
+            motion_threshold=motion_threshold,
+            cooldown_seconds=cooldown_seconds,
+            jpeg_quality=85,
+            max_frames=max_frames,
+        )
+
+        return {
+            "frames": [
+                {
+                    "index": frame.index,
+                    "frameIndex": frame.frame_index,
+                    "timestamp": frame.timestamp,
+                    "motionRatio": frame.motion_ratio,
+                    "dataUrl": frame.data_url,
+                }
+                for frame in frames
+            ],
+            "count": len(frames),
+            "config": {
+                "motionThreshold": motion_threshold,
+                "cooldownSeconds": cooldown_seconds,
+                "maxFrames": max_frames,
+            },
+        }
+    except Exception as e:
+        print(f"Motion frame extraction error: {e}")
+        return Response(content=str(e), status_code=500)
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
