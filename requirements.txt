@@ -8,3 +8,4 @@ requests
 openai
 opencv-python
 numpy
+yt-dlp

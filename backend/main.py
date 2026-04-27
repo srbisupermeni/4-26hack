@@ -1,10 +1,19 @@
 import os
 import random
 import asyncio
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
 import time
+import uuid
+from pathlib import Path
+
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.responses import StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 # from google import genai (Moved to lazy loading inside endpoint)
 from openai import AsyncOpenAI
 from nba_api.stats.endpoints import scoreboardv2, playbyplayv2, leaguegamefinder
@@ -12,10 +21,20 @@ from dotenv import load_dotenv
 
 try:
     import historical_games
-    from motion_frames import extract_motion_frames
+    from motion_frames import (
+        extract_motion_frames,
+        extract_live_motion_frames,
+        MotionFrame,
+        probe_video_duration_seconds,
+    )
 except ImportError:
     from . import historical_games
-    from .motion_frames import extract_motion_frames
+    from .motion_frames import (
+        extract_motion_frames,
+        extract_live_motion_frames,
+        MotionFrame,
+        probe_video_duration_seconds,
+    )
 
 load_dotenv('.env.local')
 load_dotenv()
@@ -30,6 +49,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+BACKEND_ROOT = Path(__file__).resolve().parent
+MOTION_EXPORTS_DIR = BACKEND_ROOT / "motion_exports"
+MOTION_EXPORTS_DIR.mkdir(exist_ok=True)
+
 # Global State & Caching
 global_game_state = {
     "teams": "Connecting...",
@@ -42,6 +65,14 @@ global_game_state = {
 }
 
 connected_clients = set()
+
+# Live motion frame extraction state
+MAX_LIVE_FRAMES = 10
+live_motion_frames: list[dict] = []
+live_motion_lock = asyncio.Lock()
+live_motion_task: asyncio.Task | None = None
+live_motion_stop_event: threading.Event | None = None
+live_motion_status: dict = {"active": False, "url": None, "frameCount": 0, "error": None}
 
 MOCK_SPORTS_STATES = {
     "lol": {
@@ -238,6 +269,180 @@ async def background_nba_task():
 async def startup_event():
     # Trigger background poller on boot seamlessly
     asyncio.create_task(background_nba_task())
+
+
+# ── Live Motion Frame Extraction ──────────────────────────────────────
+
+def _resolve_yt_stream_url(youtube_url: str) -> str:
+    """Blocking: run yt-dlp to get the direct video stream URL."""
+    cmd = [sys.executable, "-m", "yt_dlp", "-f",
+           "bestvideo[height<=720]/bestvideo/best", "--get-url", youtube_url]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        raise RuntimeError(f"yt-dlp failed: {(result.stderr or '')[:200]}")
+    urls = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not urls:
+        raise RuntimeError("yt-dlp returned no URLs")
+    return urls[0]
+
+
+def _download_video_for_motion(url: str) -> tuple[str, str]:
+    """Download video with yt-dlp into a temp directory.
+
+    Returns ``(path_to_video_file, temp_dir)``; caller must ``shutil.rmtree(temp_dir)``
+    after OpenCV is done with the file.
+    """
+    td = tempfile.mkdtemp(prefix="motion_src_")
+    out_template = os.path.join(td, "source.%(ext)s")
+    cmd = [
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        "-f",
+        "bestvideo[height<=720][ext=mp4]/best[ext=mp4]/best[height<=720]/best",
+        "-o",
+        out_template,
+        "--no-playlist",
+        url,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+    if result.returncode != 0:
+        cmd_fallback = [
+            sys.executable,
+            "-m",
+            "yt_dlp",
+            "-f",
+            "best",
+            "-o",
+            out_template,
+            "--no-playlist",
+            url,
+        ]
+        result = subprocess.run(cmd_fallback, capture_output=True, text=True, timeout=3600)
+        if result.returncode != 0:
+            shutil.rmtree(td, ignore_errors=True)
+            err = (result.stderr or result.stdout or "")[:500]
+            raise RuntimeError(f"yt-dlp download failed: {err}")
+
+    for name in sorted(os.listdir(td)):
+        if not name.startswith("source.") or name.endswith(".part"):
+            continue
+        p = os.path.join(td, name)
+        if os.path.isfile(p):
+            return p, td
+    shutil.rmtree(td, ignore_errors=True)
+    raise RuntimeError("yt-dlp finished but no video file was found")
+
+
+def _on_motion_frame(frame: MotionFrame):
+    """Called from the extraction thread for each detected motion frame."""
+    frame_dict = {
+        "index": frame.index,
+        "frameIndex": frame.frame_index,
+        "timestamp": frame.timestamp,
+        "motionRatio": frame.motion_ratio,
+        "dataUrl": frame.data_url,
+    }
+    try:
+        loop = asyncio.get_event_loop()
+        loop.call_soon_threadsafe(
+            lambda: asyncio.ensure_future(_append_frame_safe(frame_dict))
+        )
+    except RuntimeError:
+        pass
+
+
+async def _append_frame_safe(frame_dict: dict):
+    async with live_motion_lock:
+        live_motion_frames.append(frame_dict)
+        if len(live_motion_frames) > MAX_LIVE_FRAMES:
+            live_motion_frames.pop(0)
+        live_motion_status["frameCount"] = len(live_motion_frames)
+
+
+async def background_live_motion_task(youtube_url: str):
+    """Resolve stream URL then run motion detection in a background thread."""
+    global live_motion_stop_event
+
+    live_motion_status.update({"active": True, "url": youtube_url, "error": None, "frameCount": 0})
+    live_motion_frames.clear()
+
+    try:
+        stream_url = await asyncio.to_thread(_resolve_yt_stream_url, youtube_url)
+        print(f"[live-motion] 已解析流 URL: {stream_url[:80]}...")
+    except Exception as e:
+        live_motion_status.update({"active": False, "error": str(e)})
+        print(f"[live-motion] 解析流 URL 失败: {e}")
+        return
+
+    live_motion_stop_event = threading.Event()
+    try:
+        await asyncio.to_thread(
+            extract_live_motion_frames,
+            stream_url,
+            pixel_diff_threshold=25,
+            motion_threshold=0.45,
+            cooldown_seconds=0.8,
+            jpeg_quality=80,
+            callback=_on_motion_frame,
+            stop_event=live_motion_stop_event,
+        )
+    except Exception as e:
+        live_motion_status.update({"active": False, "error": str(e)})
+        print(f"[live-motion] 提取出错: {e}")
+        return
+
+    live_motion_status.update({"active": False})
+    print("[live-motion] 提取任务结束")
+
+
+@app.post("/api/live-motion/start")
+async def start_live_motion(request: Request):
+    global live_motion_task
+
+    data = await request.json()
+    youtube_url = data.get("url", "").strip()
+    if not youtube_url:
+        raise HTTPException(status_code=400, detail="Missing 'url'")
+
+    if live_motion_task and not live_motion_task.done():
+        if live_motion_stop_event:
+            live_motion_stop_event.set()
+        live_motion_task.cancel()
+        try:
+            await live_motion_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    live_motion_task = asyncio.create_task(background_live_motion_task(youtube_url))
+    return {"status": "started", "url": youtube_url}
+
+
+@app.post("/api/live-motion/stop")
+async def stop_live_motion():
+    global live_motion_task
+
+    if live_motion_stop_event:
+        live_motion_stop_event.set()
+    if live_motion_task and not live_motion_task.done():
+        live_motion_task.cancel()
+        try:
+            await live_motion_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    live_motion_status.update({"active": False, "frameCount": 0})
+    live_motion_frames.clear()
+    return {"status": "stopped"}
+
+
+@app.get("/api/live-motion/frames")
+async def get_live_motion_frames():
+    async with live_motion_lock:
+        return {
+            "frames": list(live_motion_frames),
+            "status": dict(live_motion_status),
+        }
 
 @app.websocket("/api/ws/{sport}")
 async def websocket_sport_endpoint(websocket: WebSocket, sport: str):
@@ -866,3 +1071,126 @@ async def extract_motion_frames_endpoint(
     finally:
         if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
+
+
+@app.post("/api/vision/motion-frames-url")
+async def extract_motion_frames_from_url(request: Request):
+    """Download a VOD video from URL (via yt-dlp), extract motion frames, save JPEGs to ``motion_exports/<sessionId>/``.
+
+    By default only the **first 5 minutes** of the file are decoded for extraction
+    (``max_duration_seconds`` defaults to ``300``). Pass ``max_duration_seconds: null``
+    in JSON to process the full video length after download.
+
+    Pass ``last_n_seconds`` (e.g. ``300``) to decode only the **last** N seconds
+    (duration is probed after download; requires ffprobe if OpenCV cannot read length).
+    """
+    data = await request.json()
+    url = (data.get("url") or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="Missing 'url'")
+
+    # 默认阈值偏低：0.75 适合「切镜」类大变化，相邻帧运动画面往往达不到，容易 0 张
+    motion_threshold = float(data.get("motion_threshold", 0.4))
+    cooldown_seconds = float(data.get("cooldown_seconds", 0.12))
+
+    start_seconds = 0.0
+    video_duration: float | None = None
+    last_n_applied: float | None = None
+
+    if data.get("last_n_seconds") is not None:
+        last_n_applied = float(data.get("last_n_seconds"))
+    elif "start_seconds" in data:
+        start_seconds = float(data.get("start_seconds") or 0)
+
+    if "max_duration_seconds" in data:
+        mds = data.get("max_duration_seconds")
+        max_duration_seconds = None if mds is None else float(mds)
+    else:
+        max_duration_seconds = 300.0 if last_n_applied is None else None
+
+    if last_n_applied is not None:
+        max_duration_seconds = last_n_applied
+
+    session_id = uuid.uuid4().hex
+    out_dir = MOTION_EXPORTS_DIR / session_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    temp_dl = None
+    try:
+        video_path, temp_dl = await asyncio.to_thread(_download_video_for_motion, url)
+
+        if last_n_applied is not None:
+            video_duration = await asyncio.to_thread(probe_video_duration_seconds, video_path)
+            start_seconds = max(0.0, float(video_duration) - last_n_applied)
+
+        frames = await asyncio.to_thread(
+            lambda: extract_motion_frames(
+                video_path,
+                str(out_dir),
+                pixel_diff_threshold=25,
+                motion_threshold=motion_threshold,
+                cooldown_seconds=cooldown_seconds,
+                jpeg_quality=85,
+                max_frames=None,
+                include_data_urls=False,
+                max_duration_seconds=max_duration_seconds,
+                start_seconds=start_seconds,
+            ),
+        )
+    except Exception as e:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        if temp_dl:
+            shutil.rmtree(temp_dl, ignore_errors=True)
+        print(f"Motion frames URL error: {e}")
+        return Response(content=str(e), status_code=500)
+
+    if temp_dl:
+        shutil.rmtree(temp_dl, ignore_errors=True)
+
+    files_sorted = sorted(
+        f.name
+        for f in out_dir.iterdir()
+        if f.is_file() and f.suffix.lower() in (".jpg", ".jpeg")
+    )
+    empty_hint = None
+    if len(frames) == 0:
+        empty_hint = (
+            "本条未检出运动帧：可尝试降低 motion_threshold（如 0.25）；"
+            "默认分析前 5 分钟；"
+            "若要最后一段可传 last_n_seconds: 300；"
+            "整段解码可传 max_duration_seconds: null（与 last_n_seconds 勿混用误读）。"
+        )
+    return {
+        "sessionId": session_id,
+        "count": len(frames),
+        "files": files_sorted,
+        "directory": str(out_dir),
+        "exportBaseUrl": f"/api/motion-exports/{session_id}/",
+        "emptyHint": empty_hint,
+        "config": {
+            "motionThreshold": motion_threshold,
+            "cooldownSeconds": cooldown_seconds,
+            "maxFrames": None,
+            "maxDurationSeconds": max_duration_seconds,
+            "startSeconds": start_seconds,
+            "videoDurationSeconds": video_duration,
+            "lastNSeconds": last_n_applied,
+        },
+        "frames": [
+            {
+                "index": fr.index,
+                "frameIndex": fr.frame_index,
+                "timestamp": fr.timestamp,
+                "motionRatio": fr.motion_ratio,
+                "fileName": os.path.basename(fr.file_path) if fr.file_path else None,
+            }
+            for fr in frames
+        ],
+    }
+
+
+app.mount(
+    "/api/motion-exports",
+    StaticFiles(directory=str(MOTION_EXPORTS_DIR)),
+    name="motion_exports",
+)

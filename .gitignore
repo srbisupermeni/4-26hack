@@ -8,3 +8,4 @@ coverage/
 *.log
 .env*
 !.env.example
+backend/motion_exports/
