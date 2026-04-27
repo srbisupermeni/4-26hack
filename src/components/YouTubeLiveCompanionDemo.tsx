@@ -13,6 +13,14 @@ declare global {
 const DEFAULT_LIVE_URL = '';
 const USER_DELAY_SECONDS = 5;
 
+type SubtitleDebugRow = {
+  id: string;
+  subtitle: string;
+  agentReply: string;
+  at: string;
+  status: 'ok' | 'error';
+};
+
 function extractYouTubeVideoId(value: string) {
   const trimmed = value.trim();
   if (!trimmed) return '';
@@ -56,6 +64,9 @@ export function YouTubeLiveCompanionDemo() {
   const [activeVideoId, setActiveVideoId] = useState('');
   const [status, setStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
   const [lastSync, setLastSync] = useState<string>('尚未同步');
+  const [subtitleInput, setSubtitleInput] = useState('');
+  const [isSendingSubtitle, setIsSendingSubtitle] = useState(false);
+  const [subtitleDebugRows, setSubtitleDebugRows] = useState<SubtitleDebugRow[]>([]);
   const userPlayerRef = useRef<any>(null);
   const modelPlayerRef = useRef<any>(null);
   const userMountId = useMemo(() => `youtube-user-${Math.random().toString(36).slice(2)}`, []);
@@ -160,6 +171,67 @@ export function YouTubeLiveCompanionDemo() {
     setActiveVideoId(nextVideoId);
   };
 
+  const sendSubtitleToAgent = async () => {
+    const subtitle = subtitleInput.trim();
+    if (!subtitle || isSendingSubtitle) return;
+
+    setIsSendingSubtitle(true);
+    try {
+      const response = await fetch('/api/pipeline/react', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          triggerReason: 'subtitle_event',
+          userMessage: subtitle,
+          activeSport: 'NBA',
+          persona: 'analyst',
+          gameContext: {
+            teams: activeVideoId ? `YouTube Live (${activeVideoId})` : 'YouTube Live',
+            score: 'live',
+            clock: new Date().toLocaleTimeString(),
+            lastPlay: subtitle,
+            excitement: 0.7,
+            isReplay: false,
+          },
+          chatHistory: [],
+          frames: [],
+        }),
+      });
+
+      if (!response.ok) {
+        const text = await response.text().catch(() => '');
+        throw new Error(text || `HTTP ${response.status}`);
+      }
+
+      const data = await response.json();
+      const agentReply = data?.output?.text || '(No output text)';
+      setSubtitleDebugRows((prev) => [
+        {
+          id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+          subtitle,
+          agentReply,
+          at: new Date().toLocaleTimeString(),
+          status: 'ok' as const,
+        },
+        ...prev,
+      ].slice(0, 20));
+      setSubtitleInput('');
+    } catch (error) {
+      setSubtitleDebugRows((prev) => [
+        {
+          id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+          subtitle,
+          agentReply: `Error: ${error instanceof Error ? error.message : String(error)}`,
+          at: new Date().toLocaleTimeString(),
+          status: 'error' as const,
+        },
+        ...prev,
+      ].slice(0, 20));
+    } finally {
+      setIsSendingSubtitle(false);
+    }
+  };
+
   return (
     <div className="w-full max-w-7xl mx-auto flex flex-col gap-5">
       <div className="glass-dark rounded-[2rem] border border-white/10 p-4 md:p-5">
@@ -244,6 +316,57 @@ export function YouTubeLiveCompanionDemo() {
 
       <div className="sr-only" aria-hidden="true">
         <div id={modelMountId} />
+      </div>
+
+      <div className="glass-dark rounded-[2rem] border border-white/10 p-4 md:p-5">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <p className="text-[10px] font-bold uppercase tracking-widest text-brand-purple">Temporary Debug Panel</p>
+            <p className="text-xs text-white/45">Test whether subtitle events reach the agent and inspect replies.</p>
+          </div>
+          <span className="text-[10px] uppercase tracking-widest text-white/35">/api/pipeline/react</span>
+        </div>
+
+        <div className="mt-3 flex flex-col md:flex-row gap-2">
+          <input
+            value={subtitleInput}
+            onChange={(event) => setSubtitleInput(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') void sendSubtitleToAgent();
+            }}
+            placeholder="Paste one subtitle line here, then send to agent..."
+            className="flex-1 h-11 rounded-xl bg-white/5 border border-white/10 px-3 text-sm focus:outline-none focus:border-brand-purple"
+          />
+          <button
+            onClick={() => void sendSubtitleToAgent()}
+            disabled={isSendingSubtitle || !subtitleInput.trim()}
+            className="h-11 px-4 rounded-xl bg-brand-purple text-white text-sm font-bold disabled:opacity-50 flex items-center justify-center gap-2"
+          >
+            {isSendingSubtitle ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+            Send subtitle event
+          </button>
+        </div>
+
+        <div className="mt-3 max-h-72 overflow-auto space-y-2">
+          {subtitleDebugRows.length === 0 ? (
+            <p className="text-xs text-white/35">No test events yet. Send one subtitle line to verify the agent reaction path.</p>
+          ) : subtitleDebugRows.map((row) => (
+            <div
+              key={row.id}
+              className={cn(
+                'rounded-xl border p-3 text-xs',
+                row.status === 'ok' ? 'border-emerald-500/30 bg-emerald-500/5' : 'border-red-500/30 bg-red-500/5'
+              )}
+            >
+              <div className="flex items-center justify-between text-[10px] uppercase tracking-widest text-white/45 mb-1">
+                <span>{row.status === 'ok' ? 'Agent reply' : 'Agent error'}</span>
+                <span>{row.at}</span>
+              </div>
+              <p className="text-white/80"><span className="text-white/45">Subtitle:</span> {row.subtitle}</p>
+              <p className="mt-1 text-white"><span className="text-white/45">Response:</span> {row.agentReply}</p>
+            </div>
+          ))}
+        </div>
       </div>
     </div>
   );
