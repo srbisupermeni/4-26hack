@@ -7,22 +7,15 @@ import {
   Environment,
   DrivingServiceMode,
 } from '@spatialwalk/avatarkit';
+import { resolveMockVoiceReply } from '../lib/mockVoiceDialogue';
+import {
+  DEFAULT_SPATIALREAL_AVATAR_ID,
+  getVoiceProfileForAvatarId,
+  type AvatarVoiceProfile,
+} from '../config/avatarVoiceProfiles';
 
-const AVATAR_ID = '2fc89f70-5060-4963-a2d7-4da4cab73c54';
+export { DEFAULT_SPATIALREAL_AVATAR_ID } from '../config/avatarVoiceProfiles';
 const APP_ID = (import.meta as any).env.VITE_SPATIALREAL_APP_ID as string;
-
-// ── Placeholder responses ─────────────────────────────────────────────────────
-// Replace this array with your agent's output when ready.
-const TEMPLATES = [
-  "Hark! What a splendid question! All the court is a stage, and the players merely athletes in Fortune's grand game!",
-  "By my troth, thou speakest words most worthy! To score, or not to score — that is the question facing our noble warriors!",
-  "What light through yonder basket breaks? It is the ball, and glory is the sun! Thou hast asked most well, my friend!",
-  "Methinks thy inquiry strikes me as profound. Even I, the Bard of Avon, am moved by such sport and passion!",
-  "Forsooth! The course of games never did run smooth, yet here we stand, witness to great valor upon the court!",
-  "By the stars above, what a magnificent thought! The field of play is where heroes are forged and legends born!",
-  "I heard thee clearly! In mine own age we had no such games of bouncing spheres, yet the passion of competition runs eternal!",
-  "Most intriguing! As I once penned — the quality of mercy is not strained, and neither is a well-placed three-point shot!",
-];
 
 // ── PCM16 converter ───────────────────────────────────────────────────────────
 export async function convertMp3ToPcm16(mp3Buffer: ArrayBuffer, sampleRate = 16000): Promise<ArrayBuffer> {
@@ -59,32 +52,74 @@ export interface SpatialRealAvatarHandle {
   stopSpeaking: () => void;
 }
 
+export type UserSpeechCapturePayload = {
+  /** Raw mic PCM not wired yet; reserved for future STT. */
+  audioBuffer: ArrayBuffer | null;
+  /** Browser SpeechRecognition transcript when available. */
+  transcript: string;
+};
+
 interface Props {
   onSpeakingChange?: (speaking: boolean) => void;
   className?: string;
   avatarWidth?: number;
   avatarHeight?: number;
+  /** SpatialReal model id; defaults to Shakespeare. */
+  avatarId?: string;
+  /** After user finishes an utterance (SR result, error, or no-SR fallback). Does not touch SDK send/start. */
+  onUserSpeechCaptured?: (payload: UserSpeechCapturePayload) => void;
+  /** When assistant TTS for `text` is about to play (before fetch/send). */
+  onAssistantUtterance?: (payload: { text: string }) => void;
+  /** Voice persona for current avatar; drives TTS TODO layer only (not SDK send). */
+  voiceProfile?: AvatarVoiceProfile;
 }
 
 type MicState = 'idle' | 'listening' | 'thinking' | 'speaking';
 
 // ── Component ─────────────────────────────────────────────────────────────────
 const SpatialRealAvatar = forwardRef<SpatialRealAvatarHandle, Props>(
-  ({ onSpeakingChange, className, avatarWidth = 260, avatarHeight = 320 }, ref) => {
+  (
+    {
+      onSpeakingChange,
+      className,
+      avatarWidth = 260,
+      avatarHeight = 320,
+      avatarId = DEFAULT_SPATIALREAL_AVATAR_ID,
+      onUserSpeechCaptured,
+      onAssistantUtterance,
+      voiceProfile,
+    },
+    ref,
+  ) => {
     const containerRef = useRef<HTMLDivElement>(null);
     const viewRef = useRef<AvatarView | null>(null);
     const recognitionRef = useRef<any>(null);
     const audioInitRef = useRef(false);
     const connectedRef = useRef(false); // true = full lip-sync; false = audio-only fallback
+    const fallbackAudioRef = useRef<HTMLAudioElement | null>(null);
+    const fallbackObjectUrlRef = useRef<string | null>(null);
+    const speakSeqRef = useRef(0);
+    const ttsAbortRef = useRef<AbortController | null>(null);
+    /** True while onresult is driving TTS — skip recognition onend → idle flicker. */
+    const awaitingSpeakFromMicRef = useRef(false);
+    /** Always latest avatar id for /api/tts (avoids stale closure on async speakText). */
+    const avatarIdRef = useRef(avatarId);
+    avatarIdRef.current = avatarId;
+    const voiceProfileRef = useRef<AvatarVoiceProfile>(
+      voiceProfile ?? getVoiceProfileForAvatarId(avatarId),
+    );
+    voiceProfileRef.current = voiceProfile ?? getVoiceProfileForAvatarId(avatarIdRef.current);
 
     const [sdkStatus, setSdkStatus] = useState<'loading' | 'ready' | 'error'>('loading');
     const [micState, setMicState] = useState<MicState>('idle');
     const [lastHeard, setLastHeard] = useState('');
     const [lastSpoken, setLastSpoken] = useState('');
 
-    // ── SDK init ──────────────────────────────────────────────────────────────
+    // ── SDK init + avatar load (token → init SDK if needed → load model by id → view)
     useEffect(() => {
       let cancelled = false;
+      setSdkStatus('loading');
+      connectedRef.current = false;
 
       (async () => {
         try {
@@ -101,7 +136,7 @@ const SpatialRealAvatar = forwardRef<SpatialRealAvatarHandle, Props>(
           }
           AvatarSDK.setSessionToken(sessionToken);
 
-          const avatar = await AvatarManager.shared.load(AVATAR_ID);
+          const avatar = await AvatarManager.shared.load(avatarId);
           if (cancelled || !containerRef.current) return;
 
           const view = new AvatarView(avatar, containerRef.current);
@@ -135,45 +170,106 @@ const SpatialRealAvatar = forwardRef<SpatialRealAvatarHandle, Props>(
 
       return () => {
         cancelled = true;
+        ttsAbortRef.current?.abort();
+        const a = fallbackAudioRef.current;
+        if (a) {
+          a.onended = null;
+          a.pause();
+          a.currentTime = 0;
+          fallbackAudioRef.current = null;
+        }
+        if (fallbackObjectUrlRef.current) {
+          URL.revokeObjectURL(fallbackObjectUrlRef.current);
+          fallbackObjectUrlRef.current = null;
+        }
+        try {
+          viewRef.current?.controller.interrupt();
+          viewRef.current?.controller.clear();
+        } catch (_) {}
         viewRef.current?.controller.close();
         viewRef.current?.dispose();
         viewRef.current = null;
+        connectedRef.current = false;
+        audioInitRef.current = false;
       };
-    }, []);
+    }, [avatarId]);
+
+    const stopFallbackAudio = () => {
+      const prev = fallbackAudioRef.current;
+      if (prev) {
+        prev.onended = null;
+        prev.pause();
+        prev.currentTime = 0;
+        fallbackAudioRef.current = null;
+      }
+      if (fallbackObjectUrlRef.current) {
+        URL.revokeObjectURL(fallbackObjectUrlRef.current);
+        fallbackObjectUrlRef.current = null;
+      }
+    };
+
+    /** Single outbound voice track: stop HTML Audio + clear avatar playback queue. */
+    const stopAllAvatarOutput = () => {
+      stopFallbackAudio();
+      try {
+        viewRef.current?.controller.interrupt();
+        viewRef.current?.controller.clear();
+      } catch (_) {}
+    };
 
     // ── Speak a text string via TTS ───────────────────────────────────────────
     // 有 WebSocket 连接：PCM16 → avatar（嘴型同步）
     // 无连接（降级）：HTML Audio 播放（静态形象 + 声音）
     const speakText = async (text: string) => {
+      speakSeqRef.current += 1;
+      const seq = speakSeqRef.current;
+      ttsAbortRef.current?.abort();
+      const ac = new AbortController();
+      ttsAbortRef.current = ac;
+
+      stopAllAvatarOutput();
       setMicState('thinking');
+      onAssistantUtterance?.({ text: text.trim() || 'Assistant response placeholder' });
       try {
+        const activeVoice = voiceProfileRef.current;
+
         const res = await fetch('/api/tts', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text }),
+          body: JSON.stringify({
+            text,
+            avatarId: avatarIdRef.current,
+            voiceStyle: activeVoice.style,
+          }),
+          signal: ac.signal,
         });
+        if (seq !== speakSeqRef.current) return;
         if (!res.ok) throw new Error('TTS failed');
         const mp3Buffer = await res.arrayBuffer();
+        if (seq !== speakSeqRef.current) return;
 
         if (connectedRef.current && viewRef.current) {
-          // 全功能：嘴型同步
           const pcm16 = await convertMp3ToPcm16(mp3Buffer);
+          if (seq !== speakSeqRef.current) return;
           viewRef.current.controller.send(pcm16, true);
         } else {
-          // 降级：HTML Audio 播放
+          stopFallbackAudio();
           const blob = new Blob([mp3Buffer], { type: 'audio/mpeg' });
           const url = URL.createObjectURL(blob);
+          fallbackObjectUrlRef.current = url;
           const audio = new Audio(url);
+          fallbackAudioRef.current = audio;
           audio.onended = () => {
+            stopFallbackAudio();
             setMicState('idle');
-            URL.revokeObjectURL(url);
           };
-          audio.play();
+          await audio.play();
         }
 
         setLastSpoken(text);
         setMicState('speaking');
       } catch (e) {
+        if ((e as Error)?.name === 'AbortError') return;
         console.error('speakText error:', e);
         setMicState('idle');
       }
@@ -186,10 +282,11 @@ const SpatialRealAvatar = forwardRef<SpatialRealAvatarHandle, Props>(
         recognitionRef.current?.stop();
         return;
       }
-      // Stop if avatar is speaking
-      if (micState === 'speaking') {
-        viewRef.current?.controller.interrupt();
-        viewRef.current?.controller.clear();
+      // Stop if avatar is speaking (or TTS in flight)
+      if (micState === 'speaking' || micState === 'thinking') {
+        speakSeqRef.current += 1;
+        ttsAbortRef.current?.abort();
+        stopAllAvatarOutput();
         setMicState('idle');
         return;
       }
@@ -205,14 +302,14 @@ const SpatialRealAvatar = forwardRef<SpatialRealAvatarHandle, Props>(
       // Start speech recognition
       const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
       if (!SR) {
-        // Fallback: just speak a random template if no SpeechRecognition API
-        const response = TEMPLATES[Math.floor(Math.random() * TEMPLATES.length)];
+        onUserSpeechCaptured?.({ audioBuffer: null, transcript: '' });
+        const response = resolveMockVoiceReply('');
         await speakText(response);
         return;
       }
 
       const rec = new SR();
-      rec.lang = 'en-US';
+      rec.lang = /^zh/i.test(navigator.language) ? 'zh-CN' : 'en-US';
       rec.interimResults = false;
       rec.maxAlternatives = 1;
 
@@ -220,15 +317,29 @@ const SpatialRealAvatar = forwardRef<SpatialRealAvatarHandle, Props>(
 
       rec.onresult = async (event: any) => {
         const transcript = event.results[0][0].transcript;
+        onUserSpeechCaptured?.({ audioBuffer: null, transcript });
         setLastHeard(transcript);
-        // ── REPLACE THIS with your agent call ────────────────────────────────
-        const response = TEMPLATES[Math.floor(Math.random() * TEMPLATES.length)];
-        // ─────────────────────────────────────────────────────────────────────
-        await speakText(response);
+        awaitingSpeakFromMicRef.current = true;
+        setMicState('thinking');
+        try {
+          const response = resolveMockVoiceReply(transcript);
+          await speakText(response);
+        } finally {
+          awaitingSpeakFromMicRef.current = false;
+        }
       };
 
-      rec.onerror = () => setMicState('idle');
-      rec.onend = () => setMicState((s) => s === 'listening' ? 'idle' : s);
+      rec.onerror = (ev: any) => {
+        if (ev?.error !== 'aborted') {
+          onUserSpeechCaptured?.({ audioBuffer: null, transcript: '' });
+        }
+        awaitingSpeakFromMicRef.current = false;
+        setMicState('idle');
+      };
+      rec.onend = () => {
+        if (awaitingSpeakFromMicRef.current) return;
+        setMicState((s) => (s === 'listening' ? 'idle' : s));
+      };
 
       recognitionRef.current = rec;
       rec.start();
@@ -236,13 +347,19 @@ const SpatialRealAvatar = forwardRef<SpatialRealAvatarHandle, Props>(
 
     // ── Expose handle for parent (useAICompanion path) ────────────────────────
     useImperativeHandle(ref, () => ({
-      sendAudio: (pcm16: ArrayBuffer) => viewRef.current?.controller.send(pcm16, true),
+      sendAudio: (pcm16: ArrayBuffer) => {
+        speakSeqRef.current += 1;
+        ttsAbortRef.current?.abort();
+        stopAllAvatarOutput();
+        viewRef.current?.controller.send(pcm16, true);
+      },
       initAudio: async () => {
         if (viewRef.current) await viewRef.current.controller.initializeAudioContext();
       },
       stopSpeaking: () => {
-        viewRef.current?.controller.interrupt();
-        viewRef.current?.controller.clear();
+        speakSeqRef.current += 1;
+        ttsAbortRef.current?.abort();
+        stopAllAvatarOutput();
       },
     }));
 

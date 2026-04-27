@@ -2,6 +2,7 @@ import os
 import random
 import asyncio
 import time
+import logging
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.responses import StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,6 +20,8 @@ except ImportError:
 
 load_dotenv('.env.local')
 load_dotenv()
+
+log = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -729,6 +732,66 @@ async def get_session_token():
 
 
 
+# OpenAI TTS — keep avatar UUIDs in sync with src/config/avatarVoiceProfiles.ts
+_DEFAULT_AVATAR_ID = "2fc89f70-5060-4963-a2d7-4da4cab73c54"
+_ALLOWED_TTS_VOICES = frozenset(
+    {"alloy", "ash", "ballad", "coral", "echo", "fable", "onyx", "nova", "sage", "shimmer", "verse"}
+)
+
+# SpatialReal avatar UUID → base voice + speed + style instructions (used with gpt-4o-mini-tts)
+_AVATAR_TTS_PROFILE = {
+    _DEFAULT_AVATAR_ID: {
+        "voice": "fable",
+        "speed": 1.0,
+        "instructions": (
+            "Speak with refined British Received Pronunciation as a mature, calm male "
+            "theatrical narrator—clear articulation, measured pace, no American accent."
+        ),
+    },
+    "ca9c5c22-6dba-4b59-ae3b-d26066f8c017": {
+        "voice": "nova",
+        "speed": 1.0,
+        "instructions": (
+            "Speak as a warm adult female assistant: soft, clear, helpful, slightly bright—"
+            "never masculine or monotone."
+        ),
+    },
+    "067bf019-4234-479d-9b6a-2021e462bcc2": {
+        "voice": "echo",
+        "speed": 1.15,
+        "instructions": (
+            "Speak as an energetic young boy watching sports: playful, excited, higher pitch energy, "
+            "short clauses—not a deep adult male announcer."
+        ),
+    },
+}
+
+_VOICE_STYLE_TTS = {
+    "british_male": _AVATAR_TTS_PROFILE[_DEFAULT_AVATAR_ID],
+    "female_soft": _AVATAR_TTS_PROFILE["ca9c5c22-6dba-4b59-ae3b-d26066f8c017"],
+    "child_energetic": _AVATAR_TTS_PROFILE["067bf019-4234-479d-9b6a-2021e462bcc2"],
+}
+
+_DEFAULT_PROFILE = {
+    "voice": "fable",
+    "speed": 1.0,
+    "instructions": _AVATAR_TTS_PROFILE[_DEFAULT_AVATAR_ID]["instructions"],
+}
+
+
+def _tts_profile_for_request(avatar_id: str, voice_style: str) -> dict:
+    if avatar_id in _AVATAR_TTS_PROFILE:
+        return dict(_AVATAR_TTS_PROFILE[avatar_id])
+    if voice_style in _VOICE_STYLE_TTS:
+        return dict(_VOICE_STYLE_TTS[voice_style])
+    return dict(_DEFAULT_PROFILE)
+
+
+def _truncate_instructions(s: str, max_len: int = 450) -> str:
+    s = (s or "").strip()
+    return s if len(s) <= max_len else s[: max_len - 1] + "…"
+
+
 @app.post("/api/tts")
 async def fetch_tts(request: Request):
     try:
@@ -736,12 +799,55 @@ async def fetch_tts(request: Request):
         text = data.get("text", "")
         if not text:
             return Response(status_code=400)
-            
+
+        raw_aid = data.get("avatarId") or data.get("avatar_id") or _DEFAULT_AVATAR_ID
+        avatar_id = str(raw_aid).strip().lower()
+
+        raw_style = data.get("voiceStyle") or data.get("voice_style")
+        voice_style = str(raw_style).strip().lower() if raw_style else ""
+
+        profile = _tts_profile_for_request(avatar_id, voice_style)
+        voice = profile.get("voice", "fable")
+        if voice not in _ALLOWED_TTS_VOICES:
+            voice = "fable"
+        try:
+            spd = float(profile.get("speed", 1.0))
+        except (TypeError, ValueError):
+            spd = 1.0
+        spd = max(0.25, min(4.0, spd))
+        instructions = _truncate_instructions(profile.get("instructions", ""))
+
+        tts_model = (os.environ.get("OPENAI_TTS_MODEL") or "gpt-4o-mini-tts").strip()
+        use_instructions = "gpt-4o" in tts_model and bool(instructions)
+
         client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-        response = await client.audio.speech.create(
-            model="tts-1",
-            voice="nova",
-            input=text
+
+        async def _create(model: str, with_instr: bool):
+            kwargs = {"model": model, "voice": voice, "input": text, "speed": spd}
+            if with_instr and instructions:
+                kwargs["instructions"] = instructions
+            return await client.audio.speech.create(**kwargs)
+
+        try:
+            response = await _create(tts_model, use_instructions)
+        except Exception as first_err:
+            if use_instructions:
+                log.warning("TTS model %s failed (%s); falling back to tts-1-hd", tts_model, first_err)
+                try:
+                    response = await _create("tts-1-hd", False)
+                except Exception as second_err:
+                    log.warning("tts-1-hd failed (%s); falling back to tts-1", second_err)
+                    response = await _create("tts-1", False)
+            else:
+                raise first_err
+
+        log.info(
+            "tts ok model=%s avatar=%s voice=%s speed=%s instr=%s",
+            tts_model,
+            avatar_id,
+            voice,
+            spd,
+            bool(instructions and use_instructions),
         )
         return Response(content=response.content, media_type="audio/mpeg")
     except Exception as e:

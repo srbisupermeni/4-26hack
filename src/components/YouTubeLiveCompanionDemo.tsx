@@ -1,6 +1,13 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { AnimatePresence, motion } from 'motion/react';
 import { Activity, Bot, Link, Loader2, Radio, Send } from 'lucide-react';
 import { cn } from '../lib/utils';
+import {
+  AVATAR_SELECTOR_OPTIONS,
+  DEFAULT_SPATIALREAL_AVATAR_ID,
+  getVoiceProfileForAvatarId,
+} from '../config/avatarVoiceProfiles';
+import type { ConversationTurn } from '../lib/conversationPipeline';
 import SpatialRealAvatar from './SpatialRealAvatar';
 
 declare global {
@@ -61,6 +68,9 @@ function loadYouTubeIframeApi() {
 
 export function YouTubeLiveCompanionDemo() {
   const [liveUrl, setLiveUrl] = useState(DEFAULT_LIVE_URL);
+  const [avatarId, setAvatarId] = useState<string>(DEFAULT_SPATIALREAL_AVATAR_ID);
+  const currentVoice = useMemo(() => getVoiceProfileForAvatarId(avatarId), [avatarId]);
+  const [conversation, setConversation] = useState<ConversationTurn[]>([]);
   const [activeVideoId, setActiveVideoId] = useState('');
   const [status, setStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
   const [lastSync, setLastSync] = useState<string>('尚未同步');
@@ -232,6 +242,31 @@ export function YouTubeLiveCompanionDemo() {
     }
   };
 
+  /** TODO: connect STT (Speech-to-Text) using `audioBuffer` when mic PCM is wired. */
+  function handleUserSpeech(audioBuffer: ArrayBuffer | null, transcript?: string) {
+    void audioBuffer;
+    const fakeText = transcript?.trim() || 'User speech placeholder';
+    setConversation((prev) => {
+      const next: ConversationTurn[] = [
+        ...prev,
+        { role: 'user', text: fakeText, timestamp: Date.now() },
+      ];
+      // TODO: future pipeline — import { generateAIResponse } from '../lib/conversationPipeline'
+      // const reply = await generateAIResponse(next);
+      // then feed `reply` into the avatar speak path (needs ref / imperative API from parent).
+      return next;
+    });
+  }
+
+  function handleAssistantResponse(text: string) {
+    const t = text.trim() || 'Assistant response placeholder';
+    setConversation((prev) => [...prev, { role: 'assistant', text: t, timestamp: Date.now() }]);
+  }
+
+  useEffect(() => {
+    console.log('Conversation:', conversation);
+  }, [conversation]);
+
   return (
     <div className="w-full max-w-7xl mx-auto flex flex-col gap-5">
       <div className="glass-dark rounded-[2rem] border border-white/10 p-4 md:p-5">
@@ -298,18 +333,72 @@ export function YouTubeLiveCompanionDemo() {
         </div>
 
         <div className="glass-dark rounded-[2.5rem] border border-white/10 overflow-hidden bg-black flex flex-col">
-          <div className="h-12 px-5 border-b border-white/10 flex items-center justify-between">
-            <div>
+          <div className="min-h-12 px-5 py-2.5 border-b border-white/10 flex items-start justify-between gap-3">
+            <div className="min-w-0 flex-1 flex flex-col gap-2">
               <p className="text-[10px] font-bold uppercase tracking-widest text-brand-purple">数字人陪伴</p>
               <p className="text-xs text-white/35">SpatialReal 数字人</p>
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="text-[10px] font-medium text-white/40 shrink-0">Avatar</span>
+                <select
+                  value={avatarId}
+                  onChange={(e) => setAvatarId(e.target.value)}
+                  aria-label="Choose avatar"
+                  className={cn(
+                    'h-8 min-w-0 flex-1 max-w-[220px] rounded-xl px-3 text-xs',
+                    'bg-white/[0.03] backdrop-blur-xl border border-white/10',
+                    'text-white/80 hover:text-white',
+                    'outline-none focus-visible:border-white/25 cursor-pointer',
+                    'appearance-none bg-[length:1rem] bg-[right_0.5rem_center] bg-no-repeat',
+                    'pr-8',
+                  )}
+                  style={{
+                    backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='rgba(255,255,255,0.45)' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E")`,
+                  }}
+                >
+                  {AVATAR_SELECTOR_OPTIONS.map((opt) => (
+                    <option key={opt.id} value={opt.id} className="bg-neutral-900 text-white">
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <p className="text-[10px] text-white/35 leading-snug">
+                Voice: {currentVoice.label}
+              </p>
             </div>
-            <Bot className="w-5 h-5 text-brand-purple" />
+            <Bot className="w-5 h-5 text-brand-purple shrink-0 mt-0.5" />
           </div>
           <div className="flex-1 flex flex-col items-center justify-center text-center p-6">
-            <SpatialRealAvatar
-              avatarWidth={300}
-              avatarHeight={400}
-            />
+            <AnimatePresence mode="wait">
+              <motion.div
+                key={avatarId}
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.22, ease: 'easeInOut' }}
+                className="flex flex-col items-center w-full"
+              >
+                <SpatialRealAvatar
+                  avatarId={avatarId}
+                  voiceProfile={currentVoice}
+                  avatarWidth={300}
+                  avatarHeight={400}
+                  onUserSpeechCaptured={(p) => handleUserSpeech(p.audioBuffer, p.transcript)}
+                  onAssistantUtterance={(p) => handleAssistantResponse(p.text)}
+                />
+              </motion.div>
+            </AnimatePresence>
+          </div>
+          <div className="px-4 py-3 border-t border-white/10 w-full text-left shrink-0">
+            <p className="text-[10px] uppercase tracking-widest text-white/25 mb-2">Conversation</p>
+            <div className="space-y-1.5 text-xs text-white/35">
+              {conversation.slice(-3).map((turn, i) => (
+                <p key={`${turn.timestamp}-${i}`} className="leading-snug line-clamp-2">
+                  <span className="text-white/45">{turn.role === 'user' ? 'User' : 'AI'}:</span>{' '}
+                  {turn.text}
+                </p>
+              ))}
+            </div>
           </div>
         </div>
       </div>
