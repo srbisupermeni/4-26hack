@@ -71,7 +71,7 @@ export function PetChatPanel({
 
   const lastAiMessage = [...messages].reverse().find(m => m.role === 'ai');
   const bubbleText = isListening
-    ? '在听... 🎤'
+    ? 'Listening... 🎤'
     : isTyping
     ? 'Thinking...'
     : lastAiMessage?.content ?? 'Hey! Ready to watch? Ask me anything!';

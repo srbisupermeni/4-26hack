@@ -2,6 +2,10 @@ import { useState, useEffect, useRef } from 'react';
 import { GameContext } from './useGameSimulation';
 import { captureFrame, fingerprintDiff, CapturedFrame } from '../lib/frameCapture';
 import {
+  DEFAULT_SPATIALREAL_AVATAR_ID,
+  getVoiceProfileForAvatarId,
+} from '../config/avatarVoiceProfiles';
+import {
   requestPipelineReaction,
   type PipelineInputResult,
   type PipelineStatus,
@@ -97,10 +101,15 @@ export function useAICompanion(
     const text = audioQueueRef.current.shift()!;
     
     try {
+      const vp = getVoiceProfileForAvatarId(DEFAULT_SPATIALREAL_AVATAR_ID);
       const res = await fetch('/api/tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text })
+        body: JSON.stringify({
+          text,
+          avatarId: DEFAULT_SPATIALREAL_AVATAR_ID,
+          voiceStyle: vp.style,
+        }),
       });
       if (!res.ok) {
         isPlayingRef.current = false;

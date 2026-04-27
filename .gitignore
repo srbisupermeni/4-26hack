@@ -8,3 +8,6 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# live_subtract run artifacts (video id + timestamp dumps)
+live_subtract/*_20*.txt

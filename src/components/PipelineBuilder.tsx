@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Brain, Check, Copy, Cpu, MessageSquare, Save, UserRound, Video } from 'lucide-react';
 import { cn } from '../lib/utils';
 
-export const PIPELINE_BUILDER_STORAGE_KEY = 'vstandby.pipeline.builder.zh.symmetric-left.v1';
+export const PIPELINE_BUILDER_STORAGE_KEY = 'vstandby.pipeline.builder.symmetric-left.v2';
 
 type PipelineNodeKind = 'source' | 'input' | 'context' | 'output' | 'avatar' | 'preview';
 
@@ -27,128 +27,135 @@ const DEFAULT_NODES: PipelineBuilderNode[] = [
   {
     id: 'model-live-feed',
     kind: 'source',
-    title: '模型 Live Edge',
-    subtitle: '同源直播的最新实时点',
+    title: 'Model live edge',
+    subtitle: 'Latest point on the same live source',
     endpoint: 'LIVE_SOURCE_URL @ live edge',
-    description: '用户给直播链接或搜索比赛后，模型端观看同一直播源的最新 live edge，提前检测慢动作和准备回复。',
+    description:
+      'After the user supplies a stream URL or search, the model watches the live edge of that source to detect slow-motion and prepare responses early.',
     x: 190,
     y: 85,
   },
   {
     id: 'user-delay-feed',
     kind: 'source',
-    title: '用户延迟流',
-    subtitle: '同源直播延迟 N 秒播放',
+    title: 'User delayed feed',
+    subtitle: 'Same source, N seconds behind',
     endpoint: 'LIVE_SOURCE_URL @ live edge - N',
-    description: '用户端播放同一 DVR 直播源延迟几秒后的位置；如果源不支持 DVR，再用后端 ring buffer 制造延迟。',
+    description:
+      'The viewer plays the same DVR-capable stream a few seconds behind; if DVR is unavailable, a backend ring buffer simulates delay.',
     x: 600,
     y: 85,
   },
   {
     id: 'subtitle-extract',
     kind: 'input',
-    title: '字幕/解说提取',
-    subtitle: '视频文件先提取文字信息',
+    title: 'Subtitle / commentary extract',
+    subtitle: 'Text from video first',
     endpoint: 'SUBTITLE_OR_ASR_ENDPOINT',
-    description: '如果输入是普通视频，优先提取字幕、解说或音轨转写，作为给输出端 LLM 的文字上下文。',
+    description:
+      'For file-based input, extract subtitles, commentary, or ASR as text context for the output LLM.',
     x: 300,
     y: 225,
   },
   {
     id: 'slowmo-detector',
     kind: 'input',
-    title: 'OpenCV慢动作检测',
-    subtitle: '直播中发现回放片段',
+    title: 'OpenCV slow-motion detection',
+    subtitle: 'Find replay segments on the live feed',
     endpoint: 'OPENCV_SLOWMO_DETECTOR',
-    description: '如果输入是直播，OpenCV 持续监测慢动作回放、镜头切换、比分牌变化等触发信号。',
+    description:
+      'On live input, monitor slow-motion replays, cuts, and scoreboard changes as trigger signals.',
     x: 80,
     y: 225,
   },
   {
     id: 'frame-sampler',
     kind: 'context',
-    title: '5fps截图',
-    subtitle: '唯一慢动作输入路径',
+    title: '5 fps frame grab',
+    subtitle: 'Primary slow-motion input path',
     endpoint: '5 images / second',
-    description: '慢动作开始后每秒截取 5 张图片。我们不录整段视频，直接用字幕/解说文本 + 图片组交给输出端多模态 LLM。',
+    description:
+      'After slow-motion starts, sample five images per second. No full video recording—send text + images to the multimodal LLM.',
     x: 80,
     y: 365,
   },
   {
     id: 'multimodal-llm',
     kind: 'output',
-    title: '输出端多模态LLM',
-    subtitle: '读文字 + 图片',
+    title: 'Output multimodal LLM',
+    subtitle: 'Reads text + images',
     endpoint: 'OUTPUT_MULTIMODAL_LLM_URL',
-    description: '输出端 LLM 读取字幕/解说文字和关键帧图片，生成数字人可说的候选回复。',
+    description: 'The output model reads commentary text and key frames to generate candidate lines for the avatar.',
     x: 190,
     y: 485,
   },
   {
     id: 'prepared-response',
     kind: 'context',
-    title: '预生成话术池',
-    subtitle: '按偏好决定要不要说',
+    title: 'Prepared response pool',
+    subtitle: 'Speak or stay quiet by preference',
     endpoint: '/api/pipeline/react prepared_response',
-    description: '每个慢动作出现时先准备好要说的话，再根据用户偏好、话多话少、球员喜好选择自主输出或保持安静。',
+    description:
+      'Pre-generate lines per slow-motion moment, then choose to speak or stay silent based on user preferences and verbosity.',
     x: 190,
     y: 605,
   },
   {
     id: 'user-voice',
     kind: 'source',
-    title: '用户语音输入',
-    subtitle: '用户主动和数字人说话',
+    title: 'User voice input',
+    subtitle: 'User talks to the avatar',
     endpoint: 'MIC_INPUT',
-    description: '当用户开口时，系统需要快速语音转文字，并判断问题是否和当前慢动作片段相关。',
+    description: 'On speech, run fast STT and decide if the question relates to the current slow-motion window.',
     x: 600,
     y: 205,
   },
   {
     id: 'stt-router',
     kind: 'input',
-    title: 'STT + 二分判断',
-    subtitle: '相关就秒回，不相关转大模型',
+    title: 'STT + binary router',
+    subtitle: 'On-topic fast path, else general LLM',
     endpoint: 'FAST_STT_AND_ROUTER',
-    description: '先做语音转文字，再判断：如果和当前慢动作相关且已有预生成回复，直接发给数字人；如果无关，转给通用大模型处理。',
+    description:
+      'Transcribe speech, then route: if on-topic and a prepared line exists, send it to the avatar; otherwise forward to a general model.',
     x: 600,
     y: 325,
   },
   {
     id: 'general-llm',
     kind: 'output',
-    title: '通用对话LLM',
-    subtitle: '处理非片段相关问题',
+    title: 'General chat LLM',
+    subtitle: 'Off-segment Q&A',
     endpoint: 'GENERAL_CHAT_LLM_URL',
-    description: '当用户问题和当前慢动作无关时，转入通用大模型，生成普通陪伴对话。',
+    description: 'Handle questions that are not about the current slow-motion clip with normal companion dialogue.',
     x: 600,
     y: 445,
   },
   {
     id: 'digital-human',
     kind: 'avatar',
-    title: '数字人输出',
-    subtitle: '像真人一样及时回应',
+    title: 'Digital human output',
+    subtitle: 'Voice, face, and timing',
     endpoint: 'DIGITAL_HUMAN_URL',
-    description: '数字人拿到预生成回复或通用对话回复后，输出语音、表情、动作和屏幕互动。',
+    description: 'The avatar renders prepared or general LLM text into speech, expression, and on-screen behavior.',
     x: 355,
     y: 665,
   },
 ];
 
 const EDGES: PipelineEdge[] = [
-  { from: 'model-live-feed', to: 'subtitle-extract', label: '字幕/解说' },
-  { from: 'model-live-feed', to: 'slowmo-detector', label: '画面检测' },
-  { from: 'slowmo-detector', to: 'frame-sampler', label: '慢动作触发' },
-  { from: 'frame-sampler', to: 'multimodal-llm', label: '截图组' },
-  { from: 'subtitle-extract', to: 'multimodal-llm', label: '文字上下文' },
-  { from: 'multimodal-llm', to: 'prepared-response', label: '提前生成' },
-  { from: 'prepared-response', to: 'digital-human', label: '输出给数字人' },
-  { from: 'user-delay-feed', to: 'user-voice', label: '用户观看' },
-  { from: 'user-voice', to: 'stt-router', label: '语音输入' },
-  { from: 'stt-router', to: 'prepared-response', label: '相关：取左侧预生成' },
-  { from: 'stt-router', to: 'general-llm', label: '不相关：转大模型' },
-  { from: 'general-llm', to: 'digital-human', label: '普通对话' },
+  { from: 'model-live-feed', to: 'subtitle-extract', label: 'Subtitles' },
+  { from: 'model-live-feed', to: 'slowmo-detector', label: 'Vision' },
+  { from: 'slowmo-detector', to: 'frame-sampler', label: 'Slow-mo' },
+  { from: 'frame-sampler', to: 'multimodal-llm', label: 'Frames' },
+  { from: 'subtitle-extract', to: 'multimodal-llm', label: 'Text' },
+  { from: 'multimodal-llm', to: 'prepared-response', label: 'Generate' },
+  { from: 'prepared-response', to: 'digital-human', label: 'To avatar' },
+  { from: 'user-delay-feed', to: 'user-voice', label: 'Viewing' },
+  { from: 'user-voice', to: 'stt-router', label: 'Speech' },
+  { from: 'stt-router', to: 'prepared-response', label: 'On-topic' },
+  { from: 'stt-router', to: 'general-llm', label: 'Off-topic' },
+  { from: 'general-llm', to: 'digital-human', label: 'Chat' },
 ];
 
 const NODE_ICON = {
@@ -231,10 +238,10 @@ export function PipelineBuilder() {
     <div className="glass-dark rounded-[2.5rem] border border-white/10 overflow-hidden shadow-2xl">
       <div className="p-5 border-b border-white/10 flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
-          <p className="text-[10px] font-bold uppercase tracking-widest text-brand-purple">可编辑流程图</p>
-          <h3 className="text-2xl font-bold tracking-tight">模型串联工作台</h3>
+          <p className="text-[10px] font-bold uppercase tracking-widest text-brand-purple">Editable flow</p>
+          <h3 className="text-2xl font-bold tracking-tight">Pipeline workbench</h3>
           <p className="mt-1 text-sm text-white/45">
-            拖拽节点、选择卡片，并在真实服务准备好前先填入输入模型、输出模型和数字人接口。
+            Drag nodes, select cards, and fill placeholder endpoints for input, output, and the digital human before services go live.
           </p>
         </div>
         <div className="flex gap-2">
@@ -243,7 +250,7 @@ export function PipelineBuilder() {
             className="glass px-4 py-2 rounded-xl text-xs font-bold uppercase tracking-widest hover:bg-white/10 transition-colors flex items-center gap-2"
           >
             <Copy className="w-4 h-4" />
-            {copied ? '已复制' : '复制 JSON'}
+            {copied ? 'Copied' : 'Copy JSON'}
           </button>
         </div>
       </div>
@@ -257,12 +264,16 @@ export function PipelineBuilder() {
           className="relative min-h-[820px] bg-[radial-gradient(circle_at_1px_1px,rgba(255,255,255,0.12)_1px,transparent_0)] [background-size:28px_28px] overflow-hidden"
         >
           <div className="absolute left-[4%] top-5 right-[52%] glass rounded-2xl px-4 py-3 pointer-events-none">
-            <p className="text-[10px] font-bold uppercase tracking-widest text-brand-purple">左线：伪零延迟准备</p>
-            <p className="mt-1 text-xs text-white/45">按时间顺序提前看直播、检测慢动作、截图、生成候选话术。</p>
+            <p className="text-[10px] font-bold uppercase tracking-widest text-brand-purple">Left: near–zero-latency prep</p>
+            <p className="mt-1 text-xs text-white/45">
+              Watch the feed ahead of the user, detect slow-motion, sample frames, and pre-generate lines.
+            </p>
           </div>
           <div className="absolute left-[52%] top-5 right-[4%] glass rounded-2xl px-4 py-3 pointer-events-none">
-            <p className="text-[10px] font-bold uppercase tracking-widest text-brand-purple">右线：用户实时互动</p>
-            <p className="mt-1 text-xs text-white/45">用户看延迟直播；开口后先判断是否能走预生成快路径。</p>
+            <p className="text-[10px] font-bold uppercase tracking-widest text-brand-purple">Right: live interaction</p>
+            <p className="mt-1 text-xs text-white/45">
+              The user watches a delayed stream; speech is routed to prepared lines or the general model.
+            </p>
           </div>
 
           <svg className="absolute inset-0 w-full h-full pointer-events-none" viewBox="0 0 1000 820" preserveAspectRatio="none">
@@ -343,12 +354,12 @@ export function PipelineBuilder() {
         <aside className="border-t lg:border-t-0 lg:border-l border-white/10 p-5 bg-black/35">
           <div className="flex items-center gap-2 mb-5">
             <Save className="w-4 h-4 text-brand-purple" />
-            <span className="text-[10px] font-bold uppercase tracking-widest text-white/45">当前节点</span>
+            <span className="text-[10px] font-bold uppercase tracking-widest text-white/45">Selected node</span>
           </div>
 
           <div className="space-y-4">
             <label className="block">
-              <span className="text-xs font-bold text-white/45 uppercase tracking-widest">节点标题</span>
+              <span className="text-xs font-bold text-white/45 uppercase tracking-widest">Title</span>
               <input
                 value={selectedNode.title}
                 onChange={(event) => updateSelectedNode({ title: event.target.value })}
@@ -357,7 +368,7 @@ export function PipelineBuilder() {
             </label>
 
             <label className="block">
-              <span className="text-xs font-bold text-white/45 uppercase tracking-widest">接口 / 链接</span>
+              <span className="text-xs font-bold text-white/45 uppercase tracking-widest">Endpoint / URL</span>
               <input
                 value={selectedNode.endpoint}
                 onChange={(event) => updateSelectedNode({ endpoint: event.target.value })}
@@ -367,7 +378,7 @@ export function PipelineBuilder() {
             </label>
 
             <label className="block">
-              <span className="text-xs font-bold text-white/45 uppercase tracking-widest">短说明</span>
+              <span className="text-xs font-bold text-white/45 uppercase tracking-widest">Subtitle</span>
               <input
                 value={selectedNode.subtitle}
                 onChange={(event) => updateSelectedNode({ subtitle: event.target.value })}
@@ -376,7 +387,7 @@ export function PipelineBuilder() {
             </label>
 
             <label className="block">
-              <span className="text-xs font-bold text-white/45 uppercase tracking-widest">备注</span>
+              <span className="text-xs font-bold text-white/45 uppercase tracking-widest">Description</span>
               <textarea
                 value={selectedNode.description}
                 onChange={(event) => updateSelectedNode({ description: event.target.value })}
@@ -387,10 +398,10 @@ export function PipelineBuilder() {
           </div>
 
           <div className="mt-6 rounded-2xl border border-brand-purple/20 bg-brand-purple/10 p-4">
-            <p className="text-xs font-bold uppercase tracking-widest text-brand-purple mb-2">实际接入位置</p>
+            <p className="text-xs font-bold uppercase tracking-widest text-brand-purple mb-2">Where this plugs in</p>
             <p className="text-sm text-white/65 leading-relaxed">
-              这里填写的输入、输出和数字人链接会先保存在本机浏览器，用于团队规划。真正上线时仍然通过
-              <span className="font-mono text-white"> /api/pipeline/react</span> 接入，密钥和私有服务放在后端。
+              Values you enter are saved in the browser for planning. Production traffic still uses{' '}
+              <span className="font-mono text-white">/api/pipeline/react</span> with keys and private services on the backend.
             </p>
           </div>
         </aside>

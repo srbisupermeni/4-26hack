@@ -1,7 +1,11 @@
 import os
 import random
 import asyncio
+import logging
+import subprocess
+import sys
 import time
+from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.responses import StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,6 +23,8 @@ except ImportError:
 
 load_dotenv('.env.local')
 load_dotenv()
+
+log = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -42,6 +48,48 @@ global_game_state = {
 }
 
 connected_clients = set()
+
+subtitle_clients: set[WebSocket] = set()
+subtitle_history: list[dict] = []
+SUBTITLE_HISTORY_LIMIT = 20
+
+highlight_clients: set[WebSocket] = set()
+highlight_history: list[dict] = []
+HIGHLIGHT_HISTORY_LIMIT = 20
+
+# Mirrors USER_DELAY_SECONDS in src/components/YouTubeLiveCompanionDemo.tsx.
+# Used to compute the WS `deliverAfterMs` budget so the avatar speaks exactly
+# when the user's delayed playback reaches the highlight moment.
+USER_DELAY_SECONDS = 5.0
+
+LIVE_SUBTRACT_STATE: dict[str, object] = {"proc": None, "url": None}
+LIVE_SUBTRACT_SCRIPT = Path(__file__).resolve().parent.parent / "live_subtract" / "live_subtract.py"
+
+LIVE_HIGHLIGHT_STATE: dict[str, object] = {"proc": None, "url": None}
+LIVE_HIGHLIGHT_SCRIPT = Path(__file__).resolve().parent.parent / "live_subtract" / "highlight_detect.py"
+
+
+def _stop_proc(state: dict[str, object]) -> None:
+    proc = state.get("proc")
+    if isinstance(proc, subprocess.Popen) and proc.poll() is None:
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        except Exception:
+            pass
+    state["proc"] = None
+    state["url"] = None
+
+
+def _stop_live_subtract():
+    _stop_proc(LIVE_SUBTRACT_STATE)
+
+
+def _stop_live_highlight():
+    _stop_proc(LIVE_HIGHLIGHT_STATE)
 
 MOCK_SPORTS_STATES = {
     "lol": {
@@ -238,6 +286,333 @@ async def background_nba_task():
 async def startup_event():
     # Trigger background poller on boot seamlessly
     asyncio.create_task(background_nba_task())
+
+@app.websocket("/api/ws/subtitles")
+async def websocket_subtitles_endpoint(websocket: WebSocket):
+    """Stream subtitle lines to every connected browser as they arrive."""
+    await websocket.accept()
+    subtitle_clients.add(websocket)
+    try:
+        for entry in subtitle_history[-SUBTITLE_HISTORY_LIMIT:]:
+            await websocket.send_json(entry)
+
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        subtitle_clients.discard(websocket)
+
+
+def _spawn_worker(
+    script_path: Path,
+    extra_args: list[str],
+    log_filename: str,
+    state: dict[str, object],
+    url: str,
+) -> subprocess.Popen:
+    log_dir = script_path.parent
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / log_filename
+
+    log_file = open(log_path, "ab", buffering=0)
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    cmd = [sys.executable, "-u", str(script_path), url, *extra_args]
+    process = subprocess.Popen(
+        cmd,
+        stdout=log_file,
+        stderr=log_file,
+        cwd=str(script_path.parent.parent),
+        env=env,
+    )
+    state["proc"] = process
+    state["url"] = url
+    return process
+
+
+_VALID_PERSONAS = ("analyst", "trash_talker", "emotional")
+
+
+def _normalize_persona(value: object) -> str:
+    text = str(value or "").strip()
+    return text if text in _VALID_PERSONAS else "analyst"
+
+
+@app.post("/api/subtitles/start")
+async def start_subtitle_worker(request: Request):
+    """Spawn live_subtract + highlight_detect workers for the given live URL.
+
+    The browser calls this once on connect; we replace any prior workers so
+    the user only sees data for the latest URL. The optional `persona` field
+    is forwarded to both workers so the autonomous OpenCV-driven avatar lines
+    match whichever channel (sports / drama / kids) the user is in.
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+
+    url = (data.get("url") or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="url required")
+
+    if not LIVE_SUBTRACT_SCRIPT.exists():
+        raise HTTPException(status_code=500, detail=f"live_subtract script missing at {LIVE_SUBTRACT_SCRIPT}")
+
+    persona = _normalize_persona(data.get("persona"))
+    sport = (data.get("sport") or "NBA").strip() or "NBA"
+
+    _stop_live_subtract()
+    sub_proc = _spawn_worker(
+        script_path=LIVE_SUBTRACT_SCRIPT,
+        extra_args=[
+            "--agent-url",
+            "http://127.0.0.1:8000/api/subtitles",
+            "--persona",
+            persona,
+            "--sport",
+            sport,
+        ],
+        log_filename="live_subtract.runtime.log",
+        state=LIVE_SUBTRACT_STATE,
+        url=url,
+    )
+
+    # Best-effort: also kick off the OpenCV highlight worker. Failures here
+    # should not block the subtitle pipeline.
+    highlight_pid: int | None = None
+    if LIVE_HIGHLIGHT_SCRIPT.exists():
+        try:
+            _stop_live_highlight()
+            hl_proc = _spawn_worker(
+                script_path=LIVE_HIGHLIGHT_SCRIPT,
+                extra_args=[
+                    "--agent-url",
+                    "http://127.0.0.1:8000/api/highlights",
+                    "--persona",
+                    persona,
+                    "--sport",
+                    sport,
+                ],
+                log_filename="highlight_detect.runtime.log",
+                state=LIVE_HIGHLIGHT_STATE,
+                url=url,
+            )
+            highlight_pid = hl_proc.pid
+        except Exception as exc:
+            print(f"highlight worker failed to start: {exc}")
+
+    return {
+        "status": "started",
+        "url": url,
+        "persona": persona,
+        "sport": sport,
+        "pid": sub_proc.pid,
+        "log": str(LIVE_SUBTRACT_SCRIPT.parent / "live_subtract.runtime.log"),
+        "highlightPid": highlight_pid,
+    }
+
+
+@app.post("/api/subtitles/stop")
+async def stop_subtitle_worker():
+    _stop_live_subtract()
+    _stop_live_highlight()
+    return {"status": "stopped"}
+
+
+@app.get("/api/subtitles/status")
+async def subtitle_worker_status():
+    sub_proc = LIVE_SUBTRACT_STATE.get("proc")
+    sub_running = isinstance(sub_proc, subprocess.Popen) and sub_proc.poll() is None
+    hl_proc = LIVE_HIGHLIGHT_STATE.get("proc")
+    hl_running = isinstance(hl_proc, subprocess.Popen) and hl_proc.poll() is None
+    return {
+        "running": sub_running,
+        "url": LIVE_SUBTRACT_STATE.get("url") if sub_running else None,
+        "pid": sub_proc.pid if sub_running else None,
+        "highlight": {
+            "running": hl_running,
+            "url": LIVE_HIGHLIGHT_STATE.get("url") if hl_running else None,
+            "pid": hl_proc.pid if hl_running else None,
+        },
+    }
+
+
+@app.websocket("/api/ws/highlights")
+async def websocket_highlights_endpoint(websocket: WebSocket):
+    """Stream OpenCV highlight reactions to every connected browser as they arrive."""
+    await websocket.accept()
+    highlight_clients.add(websocket)
+    try:
+        for entry in highlight_history[-HIGHLIGHT_HISTORY_LIMIT:]:
+            await websocket.send_json(entry)
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        highlight_clients.discard(websocket)
+
+
+_HIGHLIGHT_PERSONA_PROMPTS = {
+    "analyst": "You are a calm, sharp sports analyst.",
+    "trash_talker": "You are a sarcastic trash-talking sports companion.",
+    "emotional": "You are an over-the-top passionate sports superfan.",
+}
+
+
+async def _generate_highlight_reaction(
+    motion_ratio: float,
+    active_sport: str,
+    persona: str,
+    recent_subtitles: list[str],
+) -> str:
+    """Ask the LLM for a 1-sentence reaction to a detected highlight.
+
+    Falls back to a canned line if no API key is configured / the call fails.
+    The OpenCV worker only knows "lots of motion happened" so we lean on the
+    most recent live subtitle for context.
+    """
+    fallback = "Whoa — did you see that?!"
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return fallback
+
+    persona_prompt = _HIGHLIGHT_PERSONA_PROMPTS.get(persona, _HIGHLIGHT_PERSONA_PROMPTS["analyst"])
+    subtitle_excerpt = " | ".join(recent_subtitles[-3:]).strip()
+
+    try:
+        client = AsyncOpenAI(api_key=api_key)
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        f"{persona_prompt} You are a live AI companion sitting next to the user "
+                        f"watching {active_sport}. Our OpenCV pipeline just flagged a high-motion "
+                        "moment as a likely highlight. Reply in exactly ONE punchy sentence — no "
+                        "preamble, no greeting. Treat it as if it's happening right now."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Motion intensity: {motion_ratio:.2f}.\n"
+                        f"Most recent commentary: {subtitle_excerpt or '(no commentary captured)'}\n"
+                        "React now."
+                    ),
+                },
+            ],
+            timeout=8.0,
+            max_tokens=80,
+            temperature=0.8,
+        )
+        text = (response.choices[0].message.content or "").strip()
+        return text or fallback
+    except Exception as exc:
+        print(f"highlight LLM error: {exc}")
+        return fallback
+
+
+@app.post("/api/highlights")
+async def push_highlight(request: Request):
+    """Worker-facing endpoint.
+
+    OpenCV side POSTs `{timestamp, motionRatio, activeSport, persona}` whenever
+    it detects a highlight. We:
+      1. Run the LLM to produce a short avatar line.
+      2. Compute `deliverAfterMs` = USER_DELAY_SECONDS - (LLM elapsed) so the
+         frontend can fire `avatar.speak(...)` right when the user's delayed
+         playback reaches the highlighted moment.
+      3. Broadcast over /api/ws/highlights so any browser tab can pick it up.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    detected_at = float(payload.get("timestamp") or time.time())
+    try:
+        motion_ratio = float(payload.get("motionRatio") or 0.0)
+    except (TypeError, ValueError):
+        motion_ratio = 0.0
+    active_sport = (payload.get("activeSport") or "NBA").strip() or "NBA"
+    persona = (payload.get("persona") or "analyst").strip() or "analyst"
+
+    recent_subtitles = [entry.get("text", "") for entry in subtitle_history if entry.get("text")]
+    text = await _generate_highlight_reaction(
+        motion_ratio=motion_ratio,
+        active_sport=active_sport,
+        persona=persona,
+        recent_subtitles=recent_subtitles,
+    )
+
+    elapsed = max(0.0, time.time() - detected_at)
+    deliver_after_ms = max(0, int((USER_DELAY_SECONDS - elapsed) * 1000))
+
+    entry = {
+        "type": "highlight_reaction",
+        "detectedAt": detected_at,
+        "deliverAfterMs": deliver_after_ms,
+        "motionRatio": motion_ratio,
+        "activeSport": active_sport,
+        "persona": persona,
+        "text": text,
+        "timestamp": time.strftime("%H:%M:%S"),
+        "subtitleSnapshot": recent_subtitles[-3:],
+    }
+    highlight_history.append(entry)
+    if len(highlight_history) > HIGHLIGHT_HISTORY_LIMIT:
+        del highlight_history[: len(highlight_history) - HIGHLIGHT_HISTORY_LIMIT]
+
+    dead: set[WebSocket] = set()
+    for client in highlight_clients:
+        try:
+            await client.send_json(entry)
+        except WebSocketDisconnect:
+            dead.add(client)
+        except Exception:
+            dead.add(client)
+    highlight_clients.difference_update(dead)
+
+    return {"status": "ok", "delivered": len(highlight_clients), "entry": entry}
+
+
+@app.post("/api/subtitles")
+async def push_subtitle(request: Request):
+    """Receive a subtitle line from any source and broadcast it to browser clients."""
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    text = (payload.get("text") or "").strip()
+    if not text:
+        return {"status": "ignored", "reason": "empty text"}
+
+    source = (payload.get("source") or "external").strip() or "external"
+    timestamp = payload.get("timestamp")
+    if not isinstance(timestamp, str) or not timestamp:
+        timestamp = time.strftime("%H:%M:%S")
+
+    entry = {"text": text, "source": source, "timestamp": timestamp}
+    subtitle_history.append(entry)
+    if len(subtitle_history) > SUBTITLE_HISTORY_LIMIT:
+        del subtitle_history[: len(subtitle_history) - SUBTITLE_HISTORY_LIMIT]
+
+    dead_clients: set[WebSocket] = set()
+    for client in subtitle_clients:
+        try:
+            await client.send_json(entry)
+        except WebSocketDisconnect:
+            dead_clients.add(client)
+        except Exception:
+            dead_clients.add(client)
+    subtitle_clients.difference_update(dead_clients)
+
+    return {"status": "ok", "delivered": len(subtitle_clients), "entry": entry}
+
 
 @app.websocket("/api/ws/{sport}")
 async def websocket_sport_endpoint(websocket: WebSocket, sport: str):
@@ -729,6 +1104,66 @@ async def get_session_token():
 
 
 
+# OpenAI TTS — keep avatar UUIDs in sync with src/config/avatarVoiceProfiles.ts
+_DEFAULT_AVATAR_ID = "2fc89f70-5060-4963-a2d7-4da4cab73c54"
+_ALLOWED_TTS_VOICES = frozenset(
+    {"alloy", "ash", "ballad", "coral", "echo", "fable", "onyx", "nova", "sage", "shimmer", "verse"}
+)
+
+# SpatialReal avatar UUID → base voice + speed + style instructions (used with gpt-4o-mini-tts)
+_AVATAR_TTS_PROFILE = {
+    _DEFAULT_AVATAR_ID: {
+        "voice": "fable",
+        "speed": 1.0,
+        "instructions": (
+            "Speak with refined British Received Pronunciation as a mature, calm male "
+            "theatrical narrator—clear articulation, measured pace, no American accent."
+        ),
+    },
+    "ca9c5c22-6dba-4b59-ae3b-d26066f8c017": {
+        "voice": "nova",
+        "speed": 1.0,
+        "instructions": (
+            "Speak as a warm adult female assistant: soft, clear, helpful, slightly bright—"
+            "never masculine or monotone."
+        ),
+    },
+    "067bf019-4234-479d-9b6a-2021e462bcc2": {
+        "voice": "echo",
+        "speed": 1.15,
+        "instructions": (
+            "Speak as an energetic young boy watching sports: playful, excited, higher pitch energy, "
+            "short clauses—not a deep adult male announcer."
+        ),
+    },
+}
+
+_VOICE_STYLE_TTS = {
+    "british_male": _AVATAR_TTS_PROFILE[_DEFAULT_AVATAR_ID],
+    "female_soft": _AVATAR_TTS_PROFILE["ca9c5c22-6dba-4b59-ae3b-d26066f8c017"],
+    "child_energetic": _AVATAR_TTS_PROFILE["067bf019-4234-479d-9b6a-2021e462bcc2"],
+}
+
+_DEFAULT_PROFILE = {
+    "voice": "fable",
+    "speed": 1.0,
+    "instructions": _AVATAR_TTS_PROFILE[_DEFAULT_AVATAR_ID]["instructions"],
+}
+
+
+def _tts_profile_for_request(avatar_id: str, voice_style: str) -> dict:
+    if avatar_id in _AVATAR_TTS_PROFILE:
+        return dict(_AVATAR_TTS_PROFILE[avatar_id])
+    if voice_style in _VOICE_STYLE_TTS:
+        return dict(_VOICE_STYLE_TTS[voice_style])
+    return dict(_DEFAULT_PROFILE)
+
+
+def _truncate_instructions(s: str, max_len: int = 450) -> str:
+    s = (s or "").strip()
+    return s if len(s) <= max_len else s[: max_len - 1] + "…"
+
+
 @app.post("/api/tts")
 async def fetch_tts(request: Request):
     try:
@@ -736,12 +1171,55 @@ async def fetch_tts(request: Request):
         text = data.get("text", "")
         if not text:
             return Response(status_code=400)
-            
+
+        raw_aid = data.get("avatarId") or data.get("avatar_id") or _DEFAULT_AVATAR_ID
+        avatar_id = str(raw_aid).strip().lower()
+
+        raw_style = data.get("voiceStyle") or data.get("voice_style")
+        voice_style = str(raw_style).strip().lower() if raw_style else ""
+
+        profile = _tts_profile_for_request(avatar_id, voice_style)
+        voice = profile.get("voice", "fable")
+        if voice not in _ALLOWED_TTS_VOICES:
+            voice = "fable"
+        try:
+            spd = float(profile.get("speed", 1.0))
+        except (TypeError, ValueError):
+            spd = 1.0
+        spd = max(0.25, min(4.0, spd))
+        instructions = _truncate_instructions(profile.get("instructions", ""))
+
+        tts_model = (os.environ.get("OPENAI_TTS_MODEL") or "gpt-4o-mini-tts").strip()
+        use_instructions = "gpt-4o" in tts_model and bool(instructions)
+
         client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-        response = await client.audio.speech.create(
-            model="tts-1",
-            voice="nova",
-            input=text
+
+        async def _create(model: str, with_instr: bool):
+            kwargs = {"model": model, "voice": voice, "input": text, "speed": spd}
+            if with_instr and instructions:
+                kwargs["instructions"] = instructions
+            return await client.audio.speech.create(**kwargs)
+
+        try:
+            response = await _create(tts_model, use_instructions)
+        except Exception as first_err:
+            if use_instructions:
+                log.warning("TTS model %s failed (%s); falling back to tts-1-hd", tts_model, first_err)
+                try:
+                    response = await _create("tts-1-hd", False)
+                except Exception as second_err:
+                    log.warning("tts-1-hd failed (%s); falling back to tts-1", second_err)
+                    response = await _create("tts-1", False)
+            else:
+                raise first_err
+
+        log.info(
+            "tts ok model=%s avatar=%s voice=%s speed=%s instr=%s",
+            tts_model,
+            avatar_id,
+            voice,
+            spd,
+            bool(instructions and use_instructions),
         )
         return Response(content=response.content, media_type="audio/mpeg")
     except Exception as e:

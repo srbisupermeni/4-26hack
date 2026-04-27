@@ -1,11 +1,13 @@
 import argparse
 import contextlib
+import json
 import subprocess
 import sys
 import tempfile
 import time
 import wave
 from pathlib import Path
+from urllib import error, request
 from urllib.parse import parse_qs, urlparse
 
 import speech_recognition as sr
@@ -173,6 +175,76 @@ def create_session_output_file(output_dir: Path, url: str) -> Path:
     return output_dir / f"{video_id}_{stamp}.txt"
 
 
+def create_agent_output_file(subtitle_file: Path) -> Path:
+    return subtitle_file.with_name(f"{subtitle_file.stem}_agent.txt")
+
+
+def post_json(url: str, payload: dict, timeout_seconds: float) -> dict:
+    data = json.dumps(payload).encode("utf-8")
+    req = request.Request(
+        url=url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with request.urlopen(req, timeout=timeout_seconds) as resp:
+        body = resp.read().decode("utf-8")
+    return json.loads(body)
+
+
+def send_subtitle_to_agent(
+    agent_url: str,
+    subtitle_text: str,
+    active_sport: str,
+    persona: str,
+    timeout_seconds: float,
+) -> str | None:
+    """Push a subtitle line to the backend.
+
+    The default backend route is now /api/subtitles which broadcasts the line
+    over WebSocket to the browser. We also keep backwards compatibility with
+    the legacy /api/pipeline/react endpoint so existing scripts keep working.
+    """
+    if "/api/subtitles" in agent_url:
+        payload = {
+            "text": subtitle_text,
+            "source": "live_subtract",
+            "activeSport": active_sport,
+            "persona": persona,
+        }
+    else:
+        payload = {
+            "triggerReason": "subtitle_event",
+            "userMessage": subtitle_text,
+            "gameContext": {
+                "lastPlay": subtitle_text,
+                "score": "unknown",
+                "clock": "live",
+                "isReplay": False,
+            },
+            "activeSport": active_sport,
+            "persona": persona,
+            "frames": [],
+            "chatHistory": [],
+        }
+
+    try:
+        result = post_json(agent_url, payload, timeout_seconds=timeout_seconds)
+        if "/api/subtitles" in agent_url:
+            entry = result.get("entry") or {}
+            text = entry.get("text")
+            if text:
+                return f"[broadcast] {text}"
+            return None
+        return (result.get("output") or {}).get("text")
+    except error.URLError as exc:
+        return f"[agent unavailable] {exc.reason}"
+    except TimeoutError:
+        return "[agent timeout]"
+    except Exception as exc:
+        return f"[agent error] {exc}"
+
+
 def stream_live_subtitles(
     url: str,
     language: str,
@@ -180,9 +252,16 @@ def stream_live_subtitles(
     chunk_seconds: float,
     output_dir: Path,
     js_runtime: str | None,
+    agent_url: str | None,
+    active_sport: str,
+    persona: str,
+    agent_timeout_seconds: float,
 ) -> None:
     output_file = create_session_output_file(output_dir, url)
+    agent_file = create_agent_output_file(output_file)
     output_file.touch(exist_ok=True)
+    if agent_url:
+        agent_file.touch(exist_ok=True)
     recognizer = sr.Recognizer()
     ffmpeg_path = get_ffmpeg_exe()
 
@@ -191,6 +270,11 @@ def stream_live_subtitles(
     print(f"Polling every: {poll_seconds}s")
     print(f"Chunk length: {chunk_seconds}s")
     print(f"Output file: {output_file}")
+    if agent_url:
+        print(f"Agent endpoint: {agent_url}")
+        print(f"Agent log file: {agent_file}")
+    else:
+        print("Agent forwarding: disabled")
     print("Press Ctrl+C to stop.\n")
 
     last_line = ""
@@ -250,6 +334,17 @@ def stream_live_subtitles(
                         append_line(output_file, text)
                         last_line = text
                         print(f"{time.strftime('%H:%M:%S')} | + {text}")
+                        if agent_url:
+                            agent_text = send_subtitle_to_agent(
+                                agent_url=agent_url,
+                                subtitle_text=text,
+                                active_sport=active_sport,
+                                persona=persona,
+                                timeout_seconds=agent_timeout_seconds,
+                            )
+                            if agent_text:
+                                append_line(agent_file, agent_text)
+                                print(f"{time.strftime('%H:%M:%S')} | agent: {agent_text}")
                     else:
                         print(f"{time.strftime('%H:%M:%S')} | no new speech")
                     previous_chunk = wav_path
@@ -307,6 +402,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional yt-dlp JS runtime (example: node)",
     )
+    parser.add_argument(
+        "--agent-url",
+        default="http://127.0.0.1:8000/api/subtitles",
+        help="Backend agent endpoint URL. Use empty string to disable forwarding.",
+    )
+    parser.add_argument(
+        "--sport",
+        default="NBA",
+        help="Sport name sent to agent context (default: NBA)",
+    )
+    parser.add_argument(
+        "--persona",
+        default="analyst",
+        choices=["analyst", "trash_talker", "emotional"],
+        help="Persona sent to backend agent (default: analyst)",
+    )
+    parser.add_argument(
+        "--agent-timeout",
+        type=float,
+        default=6.0,
+        help="Agent request timeout in seconds (default: 6.0)",
+    )
     return parser
 
 
@@ -319,4 +436,8 @@ if __name__ == "__main__":
         chunk_seconds=max(0.7, args.chunk_seconds),
         output_dir=Path(args.output_dir),
         js_runtime=args.js_runtime,
+        agent_url=(args.agent_url.strip() or None),
+        active_sport=args.sport,
+        persona=args.persona,
+        agent_timeout_seconds=max(1.0, args.agent_timeout),
     )

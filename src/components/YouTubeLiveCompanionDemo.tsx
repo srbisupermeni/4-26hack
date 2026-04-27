@@ -1,8 +1,9 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Activity, Bot, Link, Loader2, Radio, Send, Sparkles } from 'lucide-react';
 import { cn } from '../lib/utils';
-import SpatialRealAvatar from './SpatialRealAvatar';
+import SpatialRealAvatar, { type SpatialRealAvatarHandle } from './SpatialRealAvatar';
 import type { ModeConfig } from '../lib/mode';
+import { getVoiceProfileForAvatarId } from '../config/avatarVoiceProfiles';
 
 declare global {
   interface Window {
@@ -11,8 +12,16 @@ declare global {
   }
 }
 
-const DEFAULT_LIVE_URL = '';
+const DEFAULT_LIVE_URL = 'https://www.youtube.com/watch?v=NTHIqie0axY';
 const USER_DELAY_SECONDS = 5;
+
+const SUBTITLE_BUFFER_LIMIT = 8;
+
+type SubtitleEntry = {
+  id: string;
+  text: string;
+  at: string;
+};
 
 function extractYouTubeVideoId(value: string) {
   const trimmed = value.trim();
@@ -58,14 +67,188 @@ interface Props {
 
 export function YouTubeLiveCompanionDemo({ mode }: Props) {
   const theme = mode.theme;
+  const isDarkChannel = mode.id === 'sports';
+  const voiceProfile = useMemo(
+    () => mode.voiceProfile ?? (mode.avatarId ? getVoiceProfileForAvatarId(mode.avatarId) : undefined),
+    [mode.voiceProfile, mode.avatarId],
+  );
+  const speechRecognitionLang = useMemo(() => {
+    if (mode.id === 'british_drama') return 'en-GB';
+    return 'en-US';
+  }, [mode.id]);
   const [liveUrl, setLiveUrl] = useState(DEFAULT_LIVE_URL);
   const [activeVideoId, setActiveVideoId] = useState('');
+  const [connectEpoch, setConnectEpoch] = useState(0);
   const [status, setStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
-  const [lastSync, setLastSync] = useState<string>('尚未同步');
+  const [lastSync, setLastSync] = useState<string>('Not synced yet');
+  const [subtitleBuffer, setSubtitleBuffer] = useState<SubtitleEntry[]>([]);
+  const [subtitleStreamStatus, setSubtitleStreamStatus] = useState<'connecting' | 'open' | 'closed'>('connecting');
+  const [highlightStatus, setHighlightStatus] = useState<'idle' | 'queued' | 'speaking'>('idle');
+  const [lastHighlightText, setLastHighlightText] = useState<string>('');
   const userPlayerRef = useRef<any>(null);
   const modelPlayerRef = useRef<any>(null);
+  const avatarRef = useRef<SpatialRealAvatarHandle | null>(null);
+  const subtitleBufferRef = useRef<SubtitleEntry[]>([]);
+  const highlightTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    subtitleBufferRef.current = subtitleBuffer;
+  }, [subtitleBuffer]);
+
+  const appendSubtitleEntry = (text: string, at: string) => {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    setSubtitleBuffer((prev) => {
+      const next: SubtitleEntry = {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        text: trimmed,
+        at,
+      };
+      return [next, ...prev].slice(0, SUBTITLE_BUFFER_LIMIT);
+    });
+  };
+
+  useEffect(() => {
+    let socket: WebSocket | null = null;
+    let reconnectTimer: number | undefined;
+    let cancelled = false;
+
+    const connect = () => {
+      if (cancelled) return;
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const url = `${protocol}//${window.location.host}/api/ws/subtitles`;
+      setSubtitleStreamStatus('connecting');
+      socket = new WebSocket(url);
+
+      socket.onopen = () => setSubtitleStreamStatus('open');
+      socket.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (!data?.text) return;
+          appendSubtitleEntry(String(data.text), data.timestamp || new Date().toLocaleTimeString());
+        } catch {
+          // ignore non-JSON frames
+        }
+      };
+      socket.onclose = () => {
+        if (cancelled) return;
+        setSubtitleStreamStatus('closed');
+        reconnectTimer = window.setTimeout(connect, 3000);
+      };
+      socket.onerror = () => socket?.close();
+    };
+
+    connect();
+
+    return () => {
+      cancelled = true;
+      if (reconnectTimer) window.clearTimeout(reconnectTimer);
+      socket?.close();
+    };
+  }, []);
+
+  useEffect(() => {
+    let socket: WebSocket | null = null;
+    let reconnectTimer: number | undefined;
+    let cancelled = false;
+
+    const connect = () => {
+      if (cancelled) return;
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const url = `${protocol}//${window.location.host}/api/ws/highlights`;
+      socket = new WebSocket(url);
+
+      socket.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data?.type !== 'highlight_reaction') return;
+          const text: string = String(data.text || '').trim();
+          if (!text) return;
+          const deliverAfterMs: number = Math.max(0, Number(data.deliverAfterMs) || 0);
+
+          // Schedule the avatar to speak when the user's delayed feed reaches
+          // the highlight moment. Replace any previously queued highlight so
+          // back-to-back hits don't pile up.
+          if (highlightTimerRef.current !== null) {
+            window.clearTimeout(highlightTimerRef.current);
+            highlightTimerRef.current = null;
+          }
+
+          setLastHighlightText(text);
+          setHighlightStatus('queued');
+          highlightTimerRef.current = window.setTimeout(async () => {
+            highlightTimerRef.current = null;
+            if (!mode.avatarEnabled) {
+              setHighlightStatus('idle');
+              return;
+            }
+            try {
+              setHighlightStatus('speaking');
+              await avatarRef.current?.initAudio?.();
+              avatarRef.current?.stopSpeaking?.();
+              await avatarRef.current?.speak?.(text);
+            } catch (err) {
+              console.error('Highlight avatar speak failed:', err);
+            } finally {
+              setHighlightStatus('idle');
+            }
+          }, deliverAfterMs);
+        } catch {
+          // ignore non-JSON / malformed frames
+        }
+      };
+      socket.onclose = () => {
+        if (cancelled) return;
+        reconnectTimer = window.setTimeout(connect, 3000);
+      };
+      socket.onerror = () => socket?.close();
+    };
+
+    connect();
+
+    return () => {
+      cancelled = true;
+      if (reconnectTimer) window.clearTimeout(reconnectTimer);
+      if (highlightTimerRef.current !== null) {
+        window.clearTimeout(highlightTimerRef.current);
+        highlightTimerRef.current = null;
+      }
+      socket?.close();
+    };
+  }, [mode.avatarEnabled]);
   const userMountId = useMemo(() => `youtube-user-${Math.random().toString(36).slice(2)}`, []);
   const modelMountId = useMemo(() => `youtube-model-${Math.random().toString(36).slice(2)}`, []);
+
+  const startLiveFromUrl = useCallback((rawUrl: string) => {
+    const trimmedUrl = rawUrl.trim();
+    const nextVideoId = extractYouTubeVideoId(trimmedUrl);
+    if (!nextVideoId) {
+      setStatus('error');
+      return;
+    }
+    setActiveVideoId(nextVideoId);
+    setConnectEpoch((value) => value + 1);
+
+    fetch('/api/subtitles/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        url: trimmedUrl,
+        persona: mode.persona,
+        sport: mode.sport,
+      }),
+    }).catch((error) => {
+      console.warn('Failed to start live subtitle worker:', error);
+    });
+  }, [mode.persona, mode.sport]);
+
+  const autoConnectedRef = useRef(false);
+  useEffect(() => {
+    if (!DEFAULT_LIVE_URL.trim() || autoConnectedRef.current) return;
+    autoConnectedRef.current = true;
+    startLiveFromUrl(DEFAULT_LIVE_URL);
+  }, [startLiveFromUrl]);
+
 
   useEffect(() => {
     if (!activeVideoId) return;
@@ -80,7 +263,7 @@ export function YouTubeLiveCompanionDemo({ mode }: Props) {
       return 0;
     };
 
-    const syncUserDelay = (force = false) => {
+    const seekToInitialDelay = () => {
       const userPlayer = userPlayerRef.current;
       const modelPlayer = modelPlayerRef.current;
       if (!userPlayer || !modelPlayer) return;
@@ -91,14 +274,10 @@ export function YouTubeLiveCompanionDemo({ mode }: Props) {
         if (!liveEdge || typeof userTime !== 'number') return;
 
         const delayedTime = Math.max(0, liveEdge - USER_DELAY_SECONDS);
-        if (force) {
-          userPlayer.seekTo(delayedTime, true);
-        }
-
-        const effectiveDelay = Math.max(0, Math.round(liveEdge - userTime));
-        setLastSync(force ? `启动时已设置约 ${USER_DELAY_SECONDS}s 延迟` : `当前约延迟 ${effectiveDelay}s`);
+        userPlayer.seekTo(delayedTime, true);
+        setLastSync(`Set ~${USER_DELAY_SECONDS}s delay`);
       } catch {
-        setLastSync('该直播源可能不支持 DVR seek');
+        setLastSync('This stream may not support DVR seek');
       }
     };
 
@@ -140,7 +319,7 @@ export function YouTubeLiveCompanionDemo({ mode }: Props) {
           onReady: (event: any) => {
             event.target.mute();
             event.target.playVideo();
-            window.setTimeout(() => syncUserDelay(true), 1500);
+            window.setTimeout(seekToInitialDelay, 1500);
             setStatus('ready');
           },
           onError: () => setStatus('error'),
@@ -155,15 +334,84 @@ export function YouTubeLiveCompanionDemo({ mode }: Props) {
       userPlayerRef.current = null;
       modelPlayerRef.current = null;
     };
-  }, [activeVideoId, modelMountId, userMountId]);
+  }, [activeVideoId, connectEpoch, modelMountId, userMountId]);
 
   const connectLive = () => {
-    const nextVideoId = extractYouTubeVideoId(liveUrl);
-    if (!nextVideoId) {
-      setStatus('error');
+    startLiveFromUrl(liveUrl);
+  };
+
+  const handleUserSpeech = async (transcript: string) => {
+    const userMessage = transcript.trim();
+    const t = {
+      emptyTranscript: "I didn't quite catch that—could you say it again?",
+      noReply: 'I could not generate a reply. Please try again.',
+      network: 'The service is unavailable. Check the backend and OpenAI configuration, then try again.',
+    };
+
+    if (!userMessage) {
+      if (mode.avatarEnabled) {
+        try {
+          await avatarRef.current?.initAudio?.();
+          await avatarRef.current?.speak?.(t.emptyTranscript);
+        } catch (_) {}
+      }
       return;
     }
-    setActiveVideoId(nextVideoId);
+
+    const subtitleSnapshot = subtitleBufferRef.current.map((entry) => entry.text);
+
+    const speakSafe = async (text: string) => {
+      if (!mode.avatarEnabled) return;
+      try {
+        await avatarRef.current?.initAudio?.();
+        await avatarRef.current?.speak?.(text);
+      } catch (speakError) {
+        console.error('Avatar speak failed:', speakError);
+      }
+    };
+
+    try {
+      const response = await fetch('/api/pipeline/react', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          triggerReason: 'user_message',
+          userMessage,
+          activeSport: mode.sport,
+          persona: mode.persona,
+          gameContext: {
+            teams: activeVideoId ? `YouTube Live (${activeVideoId})` : 'YouTube Live',
+            score: 'live',
+            clock: new Date().toLocaleTimeString(),
+            lastPlay: subtitleSnapshot[0] ?? 'No subtitles captured yet',
+            excitement: 0.7,
+            isReplay: false,
+          },
+          chatHistory: subtitleSnapshot.slice(0, 5).map((text) => ({
+            role: 'user',
+            content: `[subtitle] ${text}`,
+          })),
+          frames: [],
+        }),
+      });
+
+      if (!response.ok) {
+        const text = await response.text().catch(() => '');
+        throw new Error(text || `HTTP ${response.status}`);
+      }
+
+      const data = await response.json();
+      const agentReply = (data?.output?.text || '').trim();
+      if (!agentReply) {
+        await speakSafe(t.noReply);
+        return;
+      }
+
+      await speakSafe(agentReply);
+    } catch (error) {
+      console.error('Pipeline call failed:', error);
+      await speakSafe(t.network);
+    }
   };
 
   return (
@@ -207,11 +455,26 @@ export function YouTubeLiveCompanionDemo({ mode }: Props) {
             "rounded-full px-3 py-1.5 flex items-center gap-2",
             theme.pillClass,
             status === 'error' && "text-red-500",
-            status === 'ready' && (mode.id === 'sports' ? "text-emerald-400" : "text-emerald-700"),
+            status === 'ready' && (isDarkChannel ? "text-emerald-400" : "text-emerald-700"),
           )}>
             {status === 'loading' && <Loader2 className="w-3 h-3 animate-spin" />}
-            {status === 'ready' ? lastSync : status === 'error' ? '链接无效或直播不可嵌入' : '等待接入'}
+            {status === 'ready' ? lastSync : status === 'error' ? 'Invalid URL or embed blocked' : 'Waiting to connect'}
           </div>
+          {highlightStatus !== 'idle' && (
+            <div
+              className={cn(
+                'rounded-full px-3 py-1.5 flex items-center gap-2',
+                theme.pillActiveClass,
+                'animate-pulse'
+              )}
+              title={lastHighlightText}
+            >
+              <Sparkles className={cn('w-3 h-3', theme.accent)} />
+              {highlightStatus === 'queued'
+                ? 'Highlight queued—avatar will speak when you see the play'
+                : 'Avatar is calling the highlight'}
+            </div>
+          )}
         </div>
       </div>
 
@@ -236,6 +499,42 @@ export function YouTubeLiveCompanionDemo({ mode }: Props) {
               </div>
             )}
           </div>
+          <div
+            className={cn(
+              'border-t px-5 py-3 flex items-start gap-3',
+              theme.borderColor,
+              isDarkChannel
+                ? 'bg-black/70'
+                : mode.id === 'british_drama'
+                ? 'bg-[#1a0e0a]'
+                : 'bg-[#0f172a]'
+            )}
+          >
+            <div className="flex-shrink-0 mt-0.5">
+              <span
+                className={cn(
+                  'inline-flex w-2.5 h-2.5 rounded-full',
+                  subtitleStreamStatus === 'open'
+                    ? 'bg-emerald-400 animate-pulse'
+                    : subtitleStreamStatus === 'closed'
+                    ? 'bg-red-400'
+                    : 'bg-white/40 animate-pulse'
+                )}
+              />
+            </div>
+            <div className="flex-1 min-w-0">
+              <p className="text-[9px] font-bold uppercase tracking-[0.3em] text-white/55">
+                Live subtitle ·{' '}
+                {subtitleStreamStatus === 'open' ? 'Connected' : subtitleStreamStatus === 'closed' ? 'Disconnected' : 'Connecting'}
+              </p>
+              <p className="mt-1 text-base md:text-lg font-medium text-white truncate">
+                {subtitleBuffer[0]?.text ?? 'No subtitles yet—waiting for /api/subtitles…'}
+              </p>
+              {subtitleBuffer[0] && (
+                <p className="mt-0.5 text-[10px] text-white/45">{subtitleBuffer[0].at}</p>
+              )}
+            </div>
+          </div>
         </div>
 
         <div className={cn("rounded-[2.5rem] overflow-hidden flex flex-col", theme.cardClass)}>
@@ -254,9 +553,14 @@ export function YouTubeLiveCompanionDemo({ mode }: Props) {
             {mode.avatarEnabled ? (
               <SpatialRealAvatar
                 key={mode.avatarId}
+                ref={avatarRef}
                 avatarId={mode.avatarId}
+                voiceProfile={voiceProfile}
+                speechRecognitionLang={speechRecognitionLang}
                 avatarWidth={300}
                 avatarHeight={400}
+                onUserSpeech={handleUserSpeech}
+                micHintLabel="Tap to talk to the avatar"
               />
             ) : (
               <div className="flex flex-col items-center gap-4">

@@ -11,7 +11,9 @@ import {
   MessageSquare,
   TrendingUp,
   Brain,
+  ChevronDown,
   ChevronRight,
+  Check,
   Play,
   Shield,
   Cpu,
@@ -755,18 +757,18 @@ const WorkerFlowPage = () => (
     <div className="max-w-7xl mx-auto flex flex-col gap-6">
       <header className="glass-dark rounded-[2rem] border border-white/10 p-6 flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
-          <p className="text-[10px] font-bold uppercase tracking-widest text-brand-purple">内部工作人员页面</p>
-          <h1 className="text-3xl md:text-5xl font-bold tracking-tight mt-2">模型流程编辑器</h1>
+          <p className="text-[10px] font-bold uppercase tracking-widest text-brand-purple">Internal tools</p>
+          <h1 className="text-3xl md:text-5xl font-bold tracking-tight mt-2">Pipeline editor</h1>
           <p className="mt-3 max-w-2xl text-sm text-white/50 leading-relaxed">
-            用来给团队配置输入端大模型、结构化上下文、输出端大模型和数字人服务的内部流程图。
-            这个页面和面向客户的 VStandby Studio 首页是分开的。
+            Configure input models, structured context, output models, and digital-human services for the team.
+            This page is separate from the public VStandby Studio home experience.
           </p>
         </div>
         <a
           href="/"
           className="self-start md:self-center glass px-5 py-3 rounded-full text-xs font-bold uppercase tracking-widest text-white/60 hover:text-white hover:bg-white/10 transition-colors"
         >
-          返回客户页
+          Back to app
         </a>
       </header>
 
@@ -781,12 +783,26 @@ export default function App() {
     ['/BETA2026_workflow', '/worker-flow', '/flow-builder', '/internal-flow'].includes(window.location.pathname);
 
   const [mode, setMode] = useState<CompanionMode>(() => loadStoredMode());
+  const [isModeMenuOpen, setIsModeMenuOpen] = useState(false);
+  const modeMenuRef = useRef<HTMLDivElement>(null);
   const config = MODE_CONFIG[mode];
   const theme = config.theme;
 
   useEffect(() => {
     persistMode(mode);
   }, [mode]);
+
+  useEffect(() => {
+    if (!isModeMenuOpen) return;
+    const handleClick = (event: MouseEvent) => {
+      if (!modeMenuRef.current) return;
+      if (!modeMenuRef.current.contains(event.target as Node)) {
+        setIsModeMenuOpen(false);
+      }
+    };
+    window.addEventListener('mousedown', handleClick);
+    return () => window.removeEventListener('mousedown', handleClick);
+  }, [isModeMenuOpen]);
 
   if (isWorkerFlow) {
     return <WorkerFlowPage />;
@@ -806,26 +822,54 @@ export default function App() {
           <p className={cn('text-[11px] font-bold tracking-[0.4em] uppercase', theme.accent)}>VStandby</p>
           <p className={cn('text-xs mt-1', theme.textMuted)}>{config.name} · {config.caption}</p>
         </div>
-        <div
-          className={cn(
-            'inline-flex items-center gap-1 rounded-full p-1 border',
-            theme.surface
-          )}
-        >
-          {MODE_LIST.map((item) => (
-            <button
-              key={item.id}
-              type="button"
-              onClick={() => setMode(item.id)}
+        <div ref={modeMenuRef} className="relative">
+          <button
+            type="button"
+            onClick={() => setIsModeMenuOpen((value) => !value)}
+            className={cn(
+              'inline-flex items-center gap-3 rounded-full px-5 py-3 text-xs font-bold tracking-widest uppercase border transition-all',
+              theme.toggleActiveClass
+            )}
+          >
+            <span className="text-[10px] opacity-80">Channel</span>
+            <span className="flex items-center gap-2">
+              <span>{config.name}</span>
+              <span className="text-[10px] font-medium opacity-70">{MODE_LIST.find((item) => item.id === mode)?.subtitle}</span>
+            </span>
+            <ChevronDown className={cn('w-4 h-4 transition-transform', isModeMenuOpen && 'rotate-180')} />
+          </button>
+          {isModeMenuOpen && (
+            <div
               className={cn(
-                'px-4 py-2 rounded-full text-xs font-bold tracking-widest uppercase border transition-all',
-                mode === item.id ? theme.toggleActiveClass : theme.toggleIdleClass
+                'absolute right-0 mt-2 min-w-[260px] rounded-2xl p-1 z-20 shadow-xl border',
+                theme.cardClass
               )}
             >
-              <span>{item.label}</span>
-              <span className={cn('ml-2 text-[10px] font-medium opacity-70')}>{item.subtitle}</span>
-            </button>
-          ))}
+              {MODE_LIST.map((item) => {
+                const isActive = item.id === mode;
+                return (
+                  <button
+                    key={item.id}
+                    type="button"
+                    onClick={() => {
+                      setMode(item.id);
+                      setIsModeMenuOpen(false);
+                    }}
+                    className={cn(
+                      'w-full flex items-center justify-between gap-3 rounded-xl px-4 py-3 text-left transition-colors',
+                      isActive ? theme.pillActiveClass : 'hover:bg-black/5 dark:hover:bg-white/5'
+                    )}
+                  >
+                    <div>
+                      <p className={cn('text-sm font-bold', theme.textPrimary)}>{item.label}</p>
+                      <p className={cn('text-[10px] tracking-widest uppercase mt-0.5', theme.textMuted)}>{item.subtitle}</p>
+                    </div>
+                    {isActive && <Check className={cn('w-4 h-4', theme.accent)} />}
+                  </button>
+                );
+              })}
+            </div>
+          )}
         </div>
       </header>
 

@@ -7,8 +7,13 @@ import {
   Environment,
   DrivingServiceMode,
 } from '@spatialwalk/avatarkit';
+import {
+  DEFAULT_SPATIALREAL_AVATAR_ID,
+  getVoiceProfileForAvatarId,
+  type AvatarVoiceProfile,
+} from '../config/avatarVoiceProfiles';
 
-const DEFAULT_AVATAR_ID = '2fc89f70-5060-4963-a2d7-4da4cab73c54';
+const DEFAULT_AVATAR_ID = DEFAULT_SPATIALREAL_AVATAR_ID;
 const APP_ID = (import.meta as any).env.VITE_SPATIALREAL_APP_ID as string;
 
 // ── Placeholder responses ─────────────────────────────────────────────────────
@@ -57,6 +62,7 @@ export interface SpatialRealAvatarHandle {
   sendAudio: (pcm16: ArrayBuffer) => void;
   initAudio: () => Promise<void>;
   stopSpeaking: () => void;
+  speak: (text: string) => Promise<void>;
 }
 
 interface Props {
@@ -65,18 +71,45 @@ interface Props {
   avatarWidth?: number;
   avatarHeight?: number;
   avatarId?: string;
+  /** After speech is recognized, parent handles the reply (LLM, speak, etc.). */
+  onUserSpeech?: (transcript: string) => Promise<void> | void;
+  /** Mic hint when `onUserSpeech` is set. */
+  micHintLabel?: string;
+  /** Web Speech API language (e.g. en-US, en-GB). */
+  speechRecognitionLang?: string;
+  /** Voice persona for current avatar; drives /api/tts routing only (not SDK send). */
+  voiceProfile?: AvatarVoiceProfile;
 }
 
 type MicState = 'idle' | 'listening' | 'thinking' | 'speaking';
 
 // ── Component ─────────────────────────────────────────────────────────────────
 const SpatialRealAvatar = forwardRef<SpatialRealAvatarHandle, Props>(
-  ({ onSpeakingChange, className, avatarWidth = 260, avatarHeight = 320, avatarId = DEFAULT_AVATAR_ID }, ref) => {
+  (
+    {
+      onSpeakingChange,
+      className,
+      avatarWidth = 260,
+      avatarHeight = 320,
+      avatarId = DEFAULT_AVATAR_ID,
+      onUserSpeech,
+      micHintLabel,
+      speechRecognitionLang = 'en-US',
+      voiceProfile,
+    },
+    ref,
+  ) => {
     const containerRef = useRef<HTMLDivElement>(null);
     const viewRef = useRef<AvatarView | null>(null);
     const recognitionRef = useRef<any>(null);
     const audioInitRef = useRef(false);
     const connectedRef = useRef(false); // true = full lip-sync; false = audio-only fallback
+    const avatarIdRef = useRef(avatarId);
+    avatarIdRef.current = avatarId;
+    const voiceProfileRef = useRef<AvatarVoiceProfile>(
+      voiceProfile ?? getVoiceProfileForAvatarId(avatarId),
+    );
+    voiceProfileRef.current = voiceProfile ?? getVoiceProfileForAvatarId(avatarIdRef.current);
 
     const [sdkStatus, setSdkStatus] = useState<'loading' | 'ready' | 'error'>('loading');
     const [micState, setMicState] = useState<MicState>('idle');
@@ -115,20 +148,18 @@ const SpatialRealAvatar = forwardRef<SpatialRealAvatarHandle, Props>(
           };
           view.controller.onError = (err) => console.error('AvatarController:', err);
 
-          // 模型已加载 → 麦克风可用（即使 WebSocket 连接失败也能用音频回退）
           if (!cancelled) setSdkStatus('ready');
 
-          // 单独处理 WebSocket 连接，失败不影响整体
           try {
             await view.controller.start();
             connectedRef.current = true;
           } catch (connErr) {
-            console.warn('SpatialReal WebSocket 连接失败，降级为纯音频模式:', connErr);
+            console.warn('SpatialReal WebSocket failed; falling back to audio-only:', connErr);
             connectedRef.current = false;
           }
         } catch (e) {
           if (!cancelled) {
-            console.error('SpatialReal 初始化失败:', e);
+            console.error('SpatialReal init failed:', e);
             setSdkStatus('error');
           }
         }
@@ -143,25 +174,27 @@ const SpatialRealAvatar = forwardRef<SpatialRealAvatarHandle, Props>(
     }, [avatarId]);
 
     // ── Speak a text string via TTS ───────────────────────────────────────────
-    // 有 WebSocket 连接：PCM16 → avatar（嘴型同步）
-    // 无连接（降级）：HTML Audio 播放（静态形象 + 声音）
+    // With WebSocket: PCM16 → avatar (lip sync). Without: HTML Audio fallback.
     const speakText = async (text: string) => {
       setMicState('thinking');
       try {
+        const vp = voiceProfileRef.current ?? getVoiceProfileForAvatarId(avatarIdRef.current);
         const res = await fetch('/api/tts', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text }),
+          body: JSON.stringify({
+            text,
+            avatarId: avatarIdRef.current,
+            voiceStyle: vp.style,
+          }),
         });
         if (!res.ok) throw new Error('TTS failed');
         const mp3Buffer = await res.arrayBuffer();
 
         if (connectedRef.current && viewRef.current) {
-          // 全功能：嘴型同步
           const pcm16 = await convertMp3ToPcm16(mp3Buffer);
           viewRef.current.controller.send(pcm16, true);
         } else {
-          // 降级：HTML Audio 播放
           const blob = new Blob([mp3Buffer], { type: 'audio/mpeg' });
           const url = URL.createObjectURL(blob);
           const audio = new Audio(url);
@@ -213,7 +246,7 @@ const SpatialRealAvatar = forwardRef<SpatialRealAvatarHandle, Props>(
       }
 
       const rec = new SR();
-      rec.lang = 'en-US';
+      rec.lang = speechRecognitionLang;
       rec.interimResults = false;
       rec.maxAlternatives = 1;
 
@@ -222,9 +255,18 @@ const SpatialRealAvatar = forwardRef<SpatialRealAvatarHandle, Props>(
       rec.onresult = async (event: any) => {
         const transcript = event.results[0][0].transcript;
         setLastHeard(transcript);
-        // ── REPLACE THIS with your agent call ────────────────────────────────
+        if (onUserSpeech) {
+          setMicState('thinking');
+          try {
+            await onUserSpeech(transcript);
+          } catch (handlerError) {
+            console.error('onUserSpeech handler failed:', handlerError);
+          } finally {
+            setMicState((s) => s === 'thinking' ? 'idle' : s);
+          }
+          return;
+        }
         const response = TEMPLATES[Math.floor(Math.random() * TEMPLATES.length)];
-        // ─────────────────────────────────────────────────────────────────────
         await speakText(response);
       };
 
@@ -245,6 +287,7 @@ const SpatialRealAvatar = forwardRef<SpatialRealAvatarHandle, Props>(
         viewRef.current?.controller.interrupt();
         viewRef.current?.controller.clear();
       },
+      speak: speakText,
     }));
 
     // ── Mic button appearance ─────────────────────────────────────────────────
@@ -252,7 +295,7 @@ const SpatialRealAvatar = forwardRef<SpatialRealAvatarHandle, Props>(
       micState === 'listening' ? 'Listening...' :
       micState === 'thinking'  ? 'Thinking...' :
       micState === 'speaking'  ? 'Tap to stop' :
-      sdkStatus === 'ready'    ? 'Tap to speak' : '';
+      sdkStatus === 'ready'    ? (micHintLabel ?? 'Tap to speak') : '';
 
     const micColor =
       micState === 'listening' ? '#ef4444' :
@@ -268,12 +311,12 @@ const SpatialRealAvatar = forwardRef<SpatialRealAvatarHandle, Props>(
           <div ref={containerRef} style={{ width: avatarWidth, height: avatarHeight }} />
           {sdkStatus === 'loading' && (
             <div className="absolute inset-0 flex items-center justify-center text-white/40 text-xs">
-              Loading Shakespeare...
+              Loading avatar...
             </div>
           )}
           {sdkStatus === 'error' && (
             <div className="absolute bottom-2 left-0 right-0 flex justify-center">
-              <span className="text-red-400/60 text-[10px]">连接失败，音频模式运行中</span>
+              <span className="text-red-400/60 text-[10px]">Connection failed—audio-only mode</span>
             </div>
           )}
         </div>
