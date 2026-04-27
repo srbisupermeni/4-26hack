@@ -1,7 +1,8 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Activity, Bot, Link, Loader2, Radio, Send } from 'lucide-react';
+import { Activity, Bot, Link, Loader2, Radio, Send, Sparkles } from 'lucide-react';
 import { cn } from '../lib/utils';
 import SpatialRealAvatar from './SpatialRealAvatar';
+import type { ModeConfig } from '../lib/mode';
 
 declare global {
   interface Window {
@@ -51,7 +52,12 @@ function loadYouTubeIframeApi() {
   });
 }
 
-export function YouTubeLiveCompanionDemo() {
+interface Props {
+  mode: ModeConfig;
+}
+
+export function YouTubeLiveCompanionDemo({ mode }: Props) {
+  const theme = mode.theme;
   const [liveUrl, setLiveUrl] = useState(DEFAULT_LIVE_URL);
   const [activeVideoId, setActiveVideoId] = useState('');
   const [status, setStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
@@ -162,39 +168,46 @@ export function YouTubeLiveCompanionDemo() {
 
   return (
     <div className="w-full max-w-7xl mx-auto flex flex-col gap-5">
-      <div className="glass-dark rounded-[2rem] border border-white/10 p-4 md:p-5">
+      <div className={cn("rounded-[2rem] p-4 md:p-5", theme.cardClass)}>
         <div className="flex flex-col lg:flex-row gap-3 lg:items-center">
           <div className="flex-1 relative">
-            <Link className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-brand-purple" />
+            <Link className={cn("absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4", theme.accent)} />
             <input
               value={liveUrl}
               onChange={(event) => setLiveUrl(event.target.value)}
-              placeholder="粘贴 YouTube Live 链接，例如 https://www.youtube.com/watch?v=..."
-              className="w-full h-14 rounded-2xl bg-white/5 border border-white/10 pl-11 pr-4 text-sm focus:outline-none focus:border-brand-purple"
+              placeholder={theme.inputPlaceholder}
+              className={cn(
+                "w-full h-14 rounded-2xl pl-11 pr-4 text-sm border focus:outline-none transition-colors",
+                theme.inputClass
+              )}
             />
           </div>
           <button
             onClick={connectLive}
-            className="h-14 px-6 rounded-2xl bg-brand-purple text-white font-bold hover:scale-[1.02] active:scale-[0.98] transition-transform flex items-center justify-center gap-2"
+            className={cn(
+              "h-14 px-6 rounded-2xl font-bold transition-transform flex items-center justify-center gap-2",
+              theme.primaryButtonClass
+            )}
           >
             <Send className="w-4 h-4" />
-            接入直播
+            {theme.connectButtonLabel}
           </button>
         </div>
 
-        <div className="mt-4 flex flex-wrap gap-3 text-xs text-white/45">
-          <div className="glass rounded-full px-3 py-1.5 flex items-center gap-2">
-            <Radio className="w-3 h-3 text-brand-purple" />
-            模型端：同源 live edge
+        <div className={cn("mt-4 flex flex-wrap gap-3 text-xs", theme.textMuted)}>
+          <div className={cn("rounded-full px-3 py-1.5 flex items-center gap-2", theme.pillClass)}>
+            <Radio className={cn("w-3 h-3", theme.accent)} />
+            {theme.liveBadgeLabel}
           </div>
-          <div className="glass rounded-full px-3 py-1.5 flex items-center gap-2">
-            <Activity className="w-3 h-3 text-brand-purple" />
-            用户端：同源延迟 {USER_DELAY_SECONDS}s
+          <div className={cn("rounded-full px-3 py-1.5 flex items-center gap-2", theme.pillClass)}>
+            <Activity className={cn("w-3 h-3", theme.accent)} />
+            {theme.delayBadgeLabel} {USER_DELAY_SECONDS}s
           </div>
           <div className={cn(
-            "glass rounded-full px-3 py-1.5 flex items-center gap-2",
-            status === 'error' && "text-red-400",
-            status === 'ready' && "text-emerald-400"
+            "rounded-full px-3 py-1.5 flex items-center gap-2",
+            theme.pillClass,
+            status === 'error' && "text-red-500",
+            status === 'ready' && (mode.id === 'sports' ? "text-emerald-400" : "text-emerald-700"),
           )}>
             {status === 'loading' && <Loader2 className="w-3 h-3 animate-spin" />}
             {status === 'ready' ? lastSync : status === 'error' ? '链接无效或直播不可嵌入' : '等待接入'}
@@ -203,41 +216,61 @@ export function YouTubeLiveCompanionDemo() {
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-[1fr_360px] gap-5 min-h-[620px]">
-        <div className="glass-dark rounded-[2.5rem] border border-white/10 overflow-hidden bg-black shadow-2xl">
-          <div className="h-12 px-5 border-b border-white/10 flex items-center justify-between">
+        <div className={cn("rounded-[2.5rem] overflow-hidden shadow-xl", theme.cardClass)}>
+          <div className={cn("h-12 px-5 border-b flex items-center justify-between", theme.borderColor)}>
             <div>
-              <p className="text-[10px] font-bold uppercase tracking-widest text-brand-purple">用户看到的比赛</p>
-              <p className="text-xs text-white/35">YouTube Live DVR 延迟播放</p>
+              <p className={cn("text-[10px] font-bold uppercase tracking-widest", theme.accent)}>{theme.videoLabel}</p>
+              <p className={cn("text-xs", theme.textMuted)}>{theme.videoCardSubtitle}</p>
             </div>
-            <span className="text-[10px] font-bold uppercase tracking-widest text-white/35">Delay {USER_DELAY_SECONDS}s</span>
+            <span className={cn("text-[10px] font-bold uppercase tracking-widest", theme.textMuted)}>Delay {USER_DELAY_SECONDS}s</span>
           </div>
           <div className="relative aspect-video bg-black">
             {activeVideoId ? (
               <div id={userMountId} className="absolute inset-0 w-full h-full" />
             ) : (
-              <div className="absolute inset-0 flex items-center justify-center text-center p-8">
+              <div className="absolute inset-0 flex items-center justify-center text-center p-8 bg-black/80">
                 <div>
-                  <Radio className="w-10 h-10 text-white/20 mx-auto mb-4" />
-                  <p className="text-sm text-white/35">粘贴 YouTube Live 链接后开始播放</p>
+                  <Radio className="w-10 h-10 text-white/25 mx-auto mb-4" />
+                  <p className="text-sm text-white/55">{theme.videoEmptyHint}</p>
                 </div>
               </div>
             )}
           </div>
         </div>
 
-        <div className="glass-dark rounded-[2.5rem] border border-white/10 overflow-hidden bg-black flex flex-col">
-          <div className="h-12 px-5 border-b border-white/10 flex items-center justify-between">
+        <div className={cn("rounded-[2.5rem] overflow-hidden flex flex-col", theme.cardClass)}>
+          <div className={cn("h-12 px-5 border-b flex items-center justify-between", theme.borderColor)}>
             <div>
-              <p className="text-[10px] font-bold uppercase tracking-widest text-brand-purple">数字人陪伴</p>
-              <p className="text-xs text-white/35">SpatialReal 数字人</p>
+              <p className={cn("text-[10px] font-bold uppercase tracking-widest", theme.accent)}>{theme.avatarLabel}</p>
+              <p className={cn("text-xs", theme.textMuted)}>{theme.avatarCardSubtitle}</p>
             </div>
-            <Bot className="w-5 h-5 text-brand-purple" />
+            {mode.avatarEnabled ? (
+              <Sparkles className={cn("w-5 h-5", theme.accent)} />
+            ) : (
+              <Bot className={cn("w-5 h-5", theme.accent)} />
+            )}
           </div>
           <div className="flex-1 flex flex-col items-center justify-center text-center p-6">
-            <SpatialRealAvatar
-              avatarWidth={300}
-              avatarHeight={400}
-            />
+            {mode.avatarEnabled ? (
+              <SpatialRealAvatar
+                key={mode.avatarId}
+                avatarId={mode.avatarId}
+                avatarWidth={300}
+                avatarHeight={400}
+              />
+            ) : (
+              <div className="flex flex-col items-center gap-4">
+                <div className={cn("w-28 h-28 rounded-full flex items-center justify-center", theme.surfaceMuted)}>
+                  <Bot className={cn("w-12 h-12", theme.accent)} />
+                </div>
+                <div className="space-y-2 max-w-xs">
+                  <h3 className={cn("text-xl font-bold", theme.textPrimary)}>{theme.avatarPlaceholderHeading}</h3>
+                  <p className={cn("text-sm leading-relaxed", theme.textMuted)}>
+                    {theme.avatarPlaceholderBody}
+                  </p>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       </div>

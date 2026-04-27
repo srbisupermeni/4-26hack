@@ -33,6 +33,13 @@ import { PetChatPanel } from './components/PetChatPanel';
 import { PipelineBuilder } from './components/PipelineBuilder';
 import { YouTubeLiveCompanionDemo } from './components/YouTubeLiveCompanionDemo';
 import { requestPipelineReaction } from './lib/pipelineClient';
+import {
+  MODE_CONFIG,
+  MODE_LIST,
+  loadStoredMode,
+  persistMode,
+  type CompanionMode,
+} from './lib/mode';
 
 // --- Components ---
 
@@ -773,13 +780,56 @@ export default function App() {
     typeof window !== 'undefined' &&
     ['/BETA2026_workflow', '/worker-flow', '/flow-builder', '/internal-flow'].includes(window.location.pathname);
 
+  const [mode, setMode] = useState<CompanionMode>(() => loadStoredMode());
+  const config = MODE_CONFIG[mode];
+  const theme = config.theme;
+
+  useEffect(() => {
+    persistMode(mode);
+  }, [mode]);
+
   if (isWorkerFlow) {
     return <WorkerFlowPage />;
   }
 
   return (
-    <main className="min-h-screen bg-brand-dark px-4 py-4 selection:bg-brand-purple/30">
-      <YouTubeLiveCompanionDemo />
+    <main
+      className={cn(
+        'relative min-h-screen px-4 py-4 selection:bg-brand-purple/30 isolate',
+        theme.pageBg,
+        theme.textPrimary,
+        theme.pageOverlay
+      )}
+    >
+      <header className="w-full max-w-7xl mx-auto flex flex-col md:flex-row md:items-center md:justify-between gap-3 mb-5">
+        <div>
+          <p className={cn('text-[11px] font-bold tracking-[0.4em] uppercase', theme.accent)}>VStandby</p>
+          <p className={cn('text-xs mt-1', theme.textMuted)}>{config.name} · {config.caption}</p>
+        </div>
+        <div
+          className={cn(
+            'inline-flex items-center gap-1 rounded-full p-1 border',
+            theme.surface
+          )}
+        >
+          {MODE_LIST.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              onClick={() => setMode(item.id)}
+              className={cn(
+                'px-4 py-2 rounded-full text-xs font-bold tracking-widest uppercase border transition-all',
+                mode === item.id ? theme.toggleActiveClass : theme.toggleIdleClass
+              )}
+            >
+              <span>{item.label}</span>
+              <span className={cn('ml-2 text-[10px] font-medium opacity-70')}>{item.subtitle}</span>
+            </button>
+          ))}
+        </div>
+      </header>
+
+      <YouTubeLiveCompanionDemo mode={config} />
     </main>
   );
 }

@@ -8,7 +8,7 @@ import {
   DrivingServiceMode,
 } from '@spatialwalk/avatarkit';
 
-const AVATAR_ID = '2fc89f70-5060-4963-a2d7-4da4cab73c54';
+const DEFAULT_AVATAR_ID = '2fc89f70-5060-4963-a2d7-4da4cab73c54';
 const APP_ID = (import.meta as any).env.VITE_SPATIALREAL_APP_ID as string;
 
 // ── Placeholder responses ─────────────────────────────────────────────────────
@@ -64,13 +64,14 @@ interface Props {
   className?: string;
   avatarWidth?: number;
   avatarHeight?: number;
+  avatarId?: string;
 }
 
 type MicState = 'idle' | 'listening' | 'thinking' | 'speaking';
 
 // ── Component ─────────────────────────────────────────────────────────────────
 const SpatialRealAvatar = forwardRef<SpatialRealAvatarHandle, Props>(
-  ({ onSpeakingChange, className, avatarWidth = 260, avatarHeight = 320 }, ref) => {
+  ({ onSpeakingChange, className, avatarWidth = 260, avatarHeight = 320, avatarId = DEFAULT_AVATAR_ID }, ref) => {
     const containerRef = useRef<HTMLDivElement>(null);
     const viewRef = useRef<AvatarView | null>(null);
     const recognitionRef = useRef<any>(null);
@@ -101,7 +102,7 @@ const SpatialRealAvatar = forwardRef<SpatialRealAvatarHandle, Props>(
           }
           AvatarSDK.setSessionToken(sessionToken);
 
-          const avatar = await AvatarManager.shared.load(AVATAR_ID);
+          const avatar = await AvatarManager.shared.load(avatarId);
           if (cancelled || !containerRef.current) return;
 
           const view = new AvatarView(avatar, containerRef.current);
@@ -139,7 +140,7 @@ const SpatialRealAvatar = forwardRef<SpatialRealAvatarHandle, Props>(
         viewRef.current?.dispose();
         viewRef.current = null;
       };
-    }, []);
+    }, [avatarId]);
 
     // ── Speak a text string via TTS ───────────────────────────────────────────
     // 有 WebSocket 连接：PCM16 → avatar（嘴型同步）
