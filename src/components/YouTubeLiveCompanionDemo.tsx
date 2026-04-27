@@ -81,10 +81,39 @@ export function YouTubeLiveCompanionDemo() {
 
   // Live motion frame extraction state
   const [motionFrames, setMotionFrames] = useState<any[]>([]);
-  const [motionStatus, setMotionStatus] = useState<{active: boolean; frameCount: number; error?: string}>({
+  const [motionStatus, setMotionStatus] = useState<{
+    active: boolean;
+    frameCount: number;
+    error?: string;
+    maxBufferFrames?: number;
+    exportBaseUrl?: string | null;
+    sessionId?: string | null;
+    captureMode?: string | null;
+    sampleIntervalSeconds?: number | null;
+  }>({
     active: false,
     frameCount: 0,
   });
+  /** 直播：内存里保留最近 N 张合格帧（滑动窗口，默认 120） */
+  const [liveMaxBufferFrames, setLiveMaxBufferFrames] = useState(120);
+  /** 直播：是否额外把每张帧写入服务器 motion_exports/live_<id>/ */
+  const [livePersistToDisk, setLivePersistToDisk] = useState(false);
+  /** 直播抽帧：定时 2s 截图 vs 运动检测（切换后会重新请求 /api/live-motion/start） */
+  const [liveCaptureMode, setLiveCaptureMode] = useState<'interval2s' | 'motion'>('interval2s');
+  const liveOptsRef = useRef({ max: 120, persist: false, captureMode: 'interval2s' as 'interval2s' | 'motion' });
+  liveOptsRef.current = {
+    max: liveMaxBufferFrames,
+    persist: livePersistToDisk,
+    captureMode: liveCaptureMode,
+  };
+
+  const liveFrameSrc = (frame: { dataUrl?: string; fileName?: string }) => {
+    const base = motionStatus.exportBaseUrl;
+    if (base && frame.fileName) {
+      return `${base}${encodeURIComponent(frame.fileName)}`;
+    }
+    return frame.dataUrl || '';
+  };
 
   const [vodExtracting, setVodExtracting] = useState(false);
   const [vodExtractError, setVodExtractError] = useState<string | null>(null);
@@ -100,6 +129,8 @@ export function YouTubeLiveCompanionDemo() {
     setActiveVideoId('');
     setMotionFrames([]);
     setMotionStatus({ active: false, frameCount: 0 });
+    setLiveMaxBufferFrames(120);
+    setLivePersistToDisk(false);
     setVodExtractResult(null);
     setVodExtractError(null);
     setVodExtractFullVideo(false);
@@ -241,11 +272,23 @@ export function YouTubeLiveCompanionDemo() {
     let cancelled = false;
     const youtubeUrl = `https://www.youtube.com/watch?v=${activeVideoId}`;
 
+    const { max, persist, captureMode } = liveOptsRef.current;
+    const buf = Math.min(500, Math.max(10, max));
     fetch('/api/live-motion/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: youtubeUrl }),
-    }).catch(err => console.error('Failed to start motion extraction:', err));
+      body: JSON.stringify({
+        url: youtubeUrl,
+        max_buffer_frames: buf,
+        persist_frames: persist,
+        motion_threshold: 0.6,
+        cooldown_seconds: 0.8,
+        compare_stride: 12,
+        ...(captureMode === 'interval2s'
+          ? { sample_interval_seconds: 2 }
+          : { sample_interval_seconds: null }),
+      }),
+    }).catch((err) => console.error('Failed to start motion extraction:', err));
 
     const pollId = window.setInterval(async () => {
       try {
@@ -259,7 +302,7 @@ export function YouTubeLiveCompanionDemo() {
       } catch {
         // Network error, will retry next poll
       }
-    }, 2000);
+    }, 1000);
 
     return () => {
       cancelled = true;
@@ -268,7 +311,7 @@ export function YouTubeLiveCompanionDemo() {
       setMotionFrames([]);
       setMotionStatus({ active: false, frameCount: 0 });
     };
-  }, [activeVideoId, playbackKind]);
+  }, [activeVideoId, playbackKind, liveCaptureMode]);
 
   const resolveYoutubeWatchUrl = () => {
     const trimmed = liveUrl.trim();
@@ -355,6 +398,64 @@ export function YouTubeLiveCompanionDemo() {
             </button>
           </div>
         </div>
+
+        {playbackKind === 'live' && (
+          <div className="flex flex-col gap-2 mb-3 text-xs">
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+              <span className="text-white/35 shrink-0">后台抽帧</span>
+              <div className="inline-flex rounded-xl p-0.5 bg-white/5 border border-white/10">
+                <button
+                  type="button"
+                  onClick={() => setLiveCaptureMode('interval2s')}
+                  className={cn(
+                    'px-3 py-1.5 rounded-lg text-xs font-bold transition-colors',
+                    liveCaptureMode === 'interval2s'
+                      ? 'bg-brand-purple text-white'
+                      : 'text-white/50 hover:text-white/80',
+                  )}
+                >
+                  每 2 秒截图
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setLiveCaptureMode('motion')}
+                  className={cn(
+                    'px-3 py-1.5 rounded-lg text-xs font-bold transition-colors',
+                    liveCaptureMode === 'motion'
+                      ? 'bg-brand-purple text-white'
+                      : 'text-white/50 hover:text-white/80',
+                  )}
+                >
+                  运动检测
+                </button>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-white/50">
+              <label className="flex items-center gap-2">
+                内存保留最近
+                <input
+                  type="number"
+                  min={10}
+                  max={500}
+                  value={liveMaxBufferFrames}
+                  onChange={(e) => setLiveMaxBufferFrames(Math.min(500, Math.max(10, Number(e.target.value) || 120)))}
+                  className="w-16 rounded-lg bg-white/5 border border-white/10 px-2 py-1 text-white"
+                />
+                张合格图（滚动更新）
+              </label>
+              <label className="flex items-center gap-2 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  className="rounded border-white/20 bg-white/5"
+                  checked={livePersistToDisk}
+                  onChange={(e) => setLivePersistToDisk(e.target.checked)}
+                />
+                同步保存每张到服务器
+              </label>
+              <span className="text-white/35">接通前调好；轮询 1s 拉最新列表</span>
+            </div>
+          </div>
+        )}
 
         <div className="flex flex-col lg:flex-row gap-3 lg:items-center">
           <div className="flex-1 relative">
@@ -468,7 +569,11 @@ export function YouTubeLiveCompanionDemo() {
             <div className="glass rounded-full px-3 py-1.5 flex items-center gap-2">
               <Eye className="w-3 h-3 text-brand-purple" />
               <span className="text-xs">
-                {motionStatus.active ? `运动帧提取中 (${motionFrames.length})` : '运动帧提取未启动'}
+                {motionStatus.active
+                  ? motionStatus.captureMode === 'interval'
+                    ? `定时截屏（每 ${motionStatus.sampleIntervalSeconds ?? 2}s）· 缓冲 ${motionFrames.length}/${motionStatus.maxBufferFrames ?? liveMaxBufferFrames}`
+                    : `运动帧提取中 · 缓冲 ${motionFrames.length}/${motionStatus.maxBufferFrames ?? liveMaxBufferFrames}`
+                  : '后台截屏未启动'}
               </span>
             </div>
           )}
@@ -492,7 +597,7 @@ export function YouTubeLiveCompanionDemo() {
             {motionFrames.map((frame) => (
               <div key={frame.index} className="shrink-0 w-28 h-16 rounded-lg overflow-hidden border border-white/10 relative">
                 <img
-                  src={frame.dataUrl}
+                  src={liveFrameSrc(frame)}
                   alt={`Frame ${frame.index}`}
                   className="w-full h-full object-cover"
                 />
@@ -554,7 +659,7 @@ export function YouTubeLiveCompanionDemo() {
                 {playbackKind === 'live' && motionFrames.length > 0 && (
                   <div className="absolute top-3 right-3 w-36 h-[84px] rounded-xl overflow-hidden border-2 border-brand-purple/50 shadow-lg shadow-brand-purple/20 z-10">
                     <img
-                      src={motionFrames[motionFrames.length - 1].dataUrl}
+                      src={liveFrameSrc(motionFrames[motionFrames.length - 1])}
                       alt="Live Edge"
                       className="w-full h-full object-cover"
                     />

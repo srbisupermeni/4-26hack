@@ -1,6 +1,7 @@
 import base64
 import subprocess
 import threading
+from collections import deque
 import time as _time
 from dataclasses import dataclass
 from pathlib import Path
@@ -179,8 +180,16 @@ def extract_live_motion_frames(
     jpeg_quality: int = 80,
     callback: Optional[Callable[[MotionFrame], None]] = None,
     stop_event: Optional[threading.Event] = None,
+    compare_stride: int = 1,
+    sample_interval_seconds: Optional[float] = None,
 ):
     """Read a network stream, yield MotionFrame via callback on scene change.
+
+    If ``sample_interval_seconds`` is set (e.g. ``2.0``), emits one frame every
+    that many wall-clock seconds **without** motion gating (timed screenshots).
+
+    Otherwise uses frame differencing. ``compare_stride``: compare current frame
+    to the one this many frames **earlier** (not only consecutive).
 
     Blocks the calling thread. Designed to be called via asyncio.to_thread().
     """
@@ -192,12 +201,17 @@ def extract_live_motion_frames(
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    prev_gray = None
+    stride = max(1, int(compare_stride))
+    gray_ring: deque = deque(maxlen=stride + 1)
     frame_idx = 0
     saved_idx = 0
     last_save_time = -999.0
     consecutive_errors = 0
     start_time = _time.monotonic()
+    use_interval = sample_interval_seconds is not None and float(sample_interval_seconds) > 0
+    interval = float(sample_interval_seconds) if use_interval else 0.0
+    # 首次在「开始后 interval 秒」截第一张，之后每 interval 秒一张（按实际耗时对齐）
+    next_sample_at = interval if use_interval else 0.0
 
     try:
         while not (stop_event and stop_event.is_set()):
@@ -212,16 +226,34 @@ def extract_live_motion_frames(
             consecutive_errors = 0
 
             elapsed = _time.monotonic() - start_time
+
+            if use_interval:
+                if elapsed >= next_sample_at:
+                    saved_idx += 1
+                    next_sample_at = elapsed + interval
+                    mf = MotionFrame(
+                        index=saved_idx,
+                        frame_index=frame_idx,
+                        timestamp=elapsed,
+                        motion_ratio=1.0,
+                        data_url=_frame_to_data_url(frame, jpeg_quality),
+                    )
+                    if callback:
+                        callback(mf)
+                frame_idx += 1
+                if frame_idx % 300 == 0:
+                    print(f"[live-motion] [interval] 已读 {frame_idx} 帧，截图 {saved_idx} 张")
+                continue
+
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
-            if prev_gray is None:
-                prev_gray = gray
+            gray_ring.append(gray)
+            if len(gray_ring) <= stride:
                 frame_idx += 1
                 continue
 
-            diff = cv2.absdiff(gray, prev_gray)
-            prev_gray = gray
+            diff = cv2.absdiff(gray_ring[-1], gray_ring[0])
 
             motion_pixels = np.sum(diff > pixel_diff_threshold)
             motion_ratio = motion_pixels / diff.size

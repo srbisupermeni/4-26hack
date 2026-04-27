@@ -1,3 +1,4 @@
+import base64
 import os
 import random
 import asyncio
@@ -9,6 +10,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.responses import StreamingResponse, Response
@@ -66,13 +68,26 @@ global_game_state = {
 
 connected_clients = set()
 
-# Live motion frame extraction state
-MAX_LIVE_FRAMES = 10
+# Live motion frame extraction state (rolling buffer of latest qualifying frames)
+LIVE_DEFAULT_MAX_BUFFER = 120
 live_motion_frames: list[dict] = []
 live_motion_lock = asyncio.Lock()
 live_motion_task: asyncio.Task | None = None
 live_motion_stop_event: threading.Event | None = None
-live_motion_status: dict = {"active": False, "url": None, "frameCount": 0, "error": None}
+live_motion_persist_dir: str | None = None
+live_motion_status: dict = {
+    "active": False,
+    "url": None,
+    "frameCount": 0,
+    "error": None,
+    "maxBufferFrames": LIVE_DEFAULT_MAX_BUFFER,
+    "sessionId": None,
+    "persistPath": None,
+    "exportBaseUrl": None,
+    "compareStride": 12,
+    "captureMode": None,
+    "sampleIntervalSeconds": None,
+}
 
 MOCK_SPORTS_STATES = {
     "lol": {
@@ -334,8 +349,25 @@ def _download_video_for_motion(url: str) -> tuple[str, str]:
     raise RuntimeError("yt-dlp finished but no video file was found")
 
 
-def _on_motion_frame(frame: MotionFrame):
-    """Called from the extraction thread for each detected motion frame."""
+def _write_data_url_jpeg(data_url: str, path: str) -> None:
+    if not data_url or not data_url.startswith("data:"):
+        return
+    try:
+        b64 = data_url.split(",", 1)[1]
+        raw = base64.b64decode(b64)
+        with open(path, "wb") as f:
+            f.write(raw)
+    except (IndexError, ValueError, OSError) as e:
+        print(f"[live-motion] 写盘失败 {path}: {e}")
+
+
+def _on_motion_frame(frame: MotionFrame, *, loop: asyncio.AbstractEventLoop):
+    """Called from the extraction thread for each detected motion frame.
+
+    Must pass the main uvicorn ``loop`` — worker threads have no current event
+    loop, so ``get_event_loop()`` there fails and would drop every frame.
+    """
+    global live_motion_persist_dir
     frame_dict = {
         "index": frame.index,
         "frameIndex": frame.frame_index,
@@ -343,28 +375,41 @@ def _on_motion_frame(frame: MotionFrame):
         "motionRatio": frame.motion_ratio,
         "dataUrl": frame.data_url,
     }
-    try:
-        loop = asyncio.get_event_loop()
-        loop.call_soon_threadsafe(
-            lambda: asyncio.ensure_future(_append_frame_safe(frame_dict))
-        )
-    except RuntimeError:
-        pass
+    pd = live_motion_persist_dir
+    if pd and frame.data_url:
+        safe = f"{frame.motion_ratio:.0%}".replace("%", "pct")
+        fname = f"{frame.index:06d}_t{frame.timestamp:.2f}s_m{safe}.jpg"
+        fpath = os.path.join(pd, fname)
+        _write_data_url_jpeg(frame.data_url, fpath)
+        frame_dict["fileName"] = fname
+
+    def schedule():
+        asyncio.ensure_future(_append_frame_safe(frame_dict))
+
+    loop.call_soon_threadsafe(schedule)
 
 
 async def _append_frame_safe(frame_dict: dict):
     async with live_motion_lock:
         live_motion_frames.append(frame_dict)
-        if len(live_motion_frames) > MAX_LIVE_FRAMES:
+        cap = live_motion_status.get("maxBufferFrames", LIVE_DEFAULT_MAX_BUFFER)
+        while len(live_motion_frames) > cap:
             live_motion_frames.pop(0)
         live_motion_status["frameCount"] = len(live_motion_frames)
 
 
-async def background_live_motion_task(youtube_url: str):
+async def background_live_motion_task(
+    youtube_url: str,
+    *,
+    motion_threshold: float = 0.6,
+    cooldown_seconds: float = 0.8,
+    compare_stride: int = 12,
+    sample_interval_seconds: Optional[float] = None,
+):
     """Resolve stream URL then run motion detection in a background thread."""
     global live_motion_stop_event
 
-    live_motion_status.update({"active": True, "url": youtube_url, "error": None, "frameCount": 0})
+    live_motion_status["frameCount"] = 0
     live_motion_frames.clear()
 
     try:
@@ -376,16 +421,23 @@ async def background_live_motion_task(youtube_url: str):
         return
 
     live_motion_stop_event = threading.Event()
+    app_loop = asyncio.get_running_loop()
+
+    def _motion_cb(f: MotionFrame):
+        _on_motion_frame(f, loop=app_loop)
+
     try:
         await asyncio.to_thread(
             extract_live_motion_frames,
             stream_url,
             pixel_diff_threshold=25,
-            motion_threshold=0.45,
-            cooldown_seconds=0.8,
+            motion_threshold=motion_threshold,
+            cooldown_seconds=cooldown_seconds,
             jpeg_quality=80,
-            callback=_on_motion_frame,
+            callback=_motion_cb,
             stop_event=live_motion_stop_event,
+            compare_stride=compare_stride,
+            sample_interval_seconds=sample_interval_seconds,
         )
     except Exception as e:
         live_motion_status.update({"active": False, "error": str(e)})
@@ -398,12 +450,55 @@ async def background_live_motion_task(youtube_url: str):
 
 @app.post("/api/live-motion/start")
 async def start_live_motion(request: Request):
-    global live_motion_task
+    """Start live stream motion extraction.
+
+    JSON body:
+
+    - ``url`` (required): YouTube live page URL
+    - ``max_buffer_frames`` (optional, default 120): rolling memory window of the
+      latest qualifying frames (10–500)
+    - ``motion_threshold`` / ``cooldown_seconds``: passed to frame differencing
+    - ``compare_stride`` (optional, default 12): compare current frame to the one
+      N frames earlier (not only consecutive); makes 20%-style thresholds usable on live video
+    - ``sample_interval_seconds`` (optional, default 2): when >0, take one JPEG every
+      N seconds of wall-clock time (ignores motion differencing). When omitted, defaults to 2;
+      when ``null`` or ``0``, use motion-based extraction instead.
+    - ``persist_frames`` (optional): if true, each extracted frame is also saved as
+      JPEG under ``motion_exports/live_<sessionId>/`` (served at ``exportBaseUrl``)
+    """
+    global live_motion_task, live_motion_persist_dir
 
     data = await request.json()
     youtube_url = data.get("url", "").strip()
     if not youtube_url:
         raise HTTPException(status_code=400, detail="Missing 'url'")
+
+    max_buf = int(data.get("max_buffer_frames", LIVE_DEFAULT_MAX_BUFFER))
+    max_buf = max(10, min(500, max_buf))
+    motion_threshold = float(data.get("motion_threshold", 0.6))
+    cooldown_seconds = float(data.get("cooldown_seconds", 0.8))
+    compare_stride = int(data.get("compare_stride", 12))
+    compare_stride = max(1, min(60, compare_stride))
+    persist_frames = bool(data.get("persist_frames", False))
+    if "sample_interval_seconds" in data:
+        siv = data.get("sample_interval_seconds")
+        if siv is None:
+            sample_interval_seconds = None
+        else:
+            fv = float(siv)
+            sample_interval_seconds = None if fv <= 0 else fv
+    else:
+        sample_interval_seconds = 2.0
+
+    session_id = uuid.uuid4().hex
+    persist_path = None
+    export_base = None
+    if persist_frames:
+        persist_path = MOTION_EXPORTS_DIR / f"live_{session_id}"
+        persist_path.mkdir(parents=True, exist_ok=True)
+        persist_path = str(persist_path)
+        export_base = f"/api/motion-exports/live_{session_id}/"
+    live_motion_persist_dir = persist_path
 
     if live_motion_task and not live_motion_task.done():
         if live_motion_stop_event:
@@ -414,13 +509,49 @@ async def start_live_motion(request: Request):
         except (asyncio.CancelledError, Exception):
             pass
 
-    live_motion_task = asyncio.create_task(background_live_motion_task(youtube_url))
-    return {"status": "started", "url": youtube_url}
+    capture_mode = "interval" if sample_interval_seconds else "motion"
+    live_motion_status.update(
+        {
+            "active": True,
+            "url": youtube_url,
+            "error": None,
+            "frameCount": 0,
+            "maxBufferFrames": max_buf,
+            "sessionId": session_id,
+            "persistPath": persist_path,
+            "exportBaseUrl": export_base,
+            "compareStride": compare_stride,
+            "captureMode": capture_mode,
+            "sampleIntervalSeconds": sample_interval_seconds,
+        }
+    )
+
+    live_motion_task = asyncio.create_task(
+        background_live_motion_task(
+            youtube_url,
+            motion_threshold=motion_threshold,
+            cooldown_seconds=cooldown_seconds,
+            compare_stride=compare_stride,
+            sample_interval_seconds=sample_interval_seconds,
+        )
+    )
+    return {
+        "status": "started",
+        "url": youtube_url,
+        "sessionId": session_id,
+        "maxBufferFrames": max_buf,
+        "exportBaseUrl": export_base,
+        "persistFrames": persist_frames,
+        "compareStride": compare_stride,
+        "motionThreshold": motion_threshold,
+        "captureMode": capture_mode,
+        "sampleIntervalSeconds": sample_interval_seconds,
+    }
 
 
 @app.post("/api/live-motion/stop")
 async def stop_live_motion():
-    global live_motion_task
+    global live_motion_task, live_motion_persist_dir
 
     if live_motion_stop_event:
         live_motion_stop_event.set()
@@ -431,7 +562,19 @@ async def stop_live_motion():
         except (asyncio.CancelledError, Exception):
             pass
 
-    live_motion_status.update({"active": False, "frameCount": 0})
+    live_motion_persist_dir = None
+    live_motion_status.update(
+        {
+            "active": False,
+            "frameCount": 0,
+            "sessionId": None,
+            "persistPath": None,
+            "exportBaseUrl": None,
+            "compareStride": 12,
+            "captureMode": None,
+            "sampleIntervalSeconds": None,
+        }
+    )
     live_motion_frames.clear()
     return {"status": "stopped"}
 
