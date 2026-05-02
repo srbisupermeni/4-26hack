@@ -737,7 +737,7 @@ const HowItWorksInteractive = () => {
   );
 };
 
-const WorkerFlowPage = () => (
+export const WorkerFlowPage = () => (
   <div className="min-h-screen selection:bg-brand-purple/30 px-6 py-8">
     <div className="max-w-7xl mx-auto flex flex-col gap-6">
       <header className="glass-dark rounded-[2rem] border border-white/10 p-6 flex flex-col md:flex-row md:items-center justify-between gap-4">
@@ -762,15 +762,7 @@ const WorkerFlowPage = () => (
   </div>
 );
 
-export default function App() {
-  const isWorkerFlow =
-    typeof window !== 'undefined' &&
-    ['/BETA2026_workflow', '/worker-flow', '/flow-builder', '/internal-flow'].includes(window.location.pathname);
-
-  if (isWorkerFlow) {
-    return <WorkerFlowPage />;
-  }
-
+export function MainApp() {
   return (
     <main className="min-h-screen bg-brand-dark px-4 py-4 selection:bg-brand-purple/30">
       <YouTubeLiveCompanionDemo />

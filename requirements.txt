@@ -8,3 +8,8 @@ requests
 opencv-python
 numpy
 yt-dlp
+sqlalchemy
+python-jose[cryptography]
+passlib[bcrypt]
+google-auth-oauthlib
+aiosqlite

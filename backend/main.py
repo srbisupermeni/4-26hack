@@ -40,6 +40,13 @@ except ImportError:
 load_dotenv('.env.local')
 load_dotenv()
 
+# Initialize database
+from backend.database import init_db
+from backend.routers.auth_router import router as auth_router
+from backend.routers.user_router import router as user_router
+
+init_db()
+
 app = FastAPI()
 
 app.add_middleware(
@@ -49,6 +56,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Include authentication and user routers
+app.include_router(auth_router)
+app.include_router(user_router)
 
 BACKEND_ROOT = Path(__file__).resolve().parent
 MOTION_EXPORTS_DIR = BACKEND_ROOT / "motion_exports"
