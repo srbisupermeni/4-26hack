@@ -1,7 +1,8 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Activity, Bot, Clapperboard, Eye, Film, Link, Loader2, Radio, Send } from 'lucide-react';
 import { cn } from '../lib/utils';
-import SpatialRealAvatar from './SpatialRealAvatar';
+import SpatialRealAvatar, { type SpatialRealAvatarHandle } from './SpatialRealAvatar';
+import { useAICompanion } from '../hooks/useAICompanion';
 
 declare global {
   interface Window {
@@ -106,6 +107,18 @@ export function YouTubeLiveCompanionDemo() {
     persist: livePersistToDisk,
     captureMode: liveCaptureMode,
   };
+
+  const spatialRealRef = useRef<SpatialRealAvatarHandle>(null);
+
+  const gameContext = useMemo(() => ({
+    teams: 'YouTube',
+    score: '',
+    clock: '',
+    lastPlay: activeVideoId ? `Watching video: ${activeVideoId}` : 'Watching YouTube',
+    excitement: 0.5,
+  }), [activeVideoId]);
+
+  const { sendMessage } = useAICompanion(gameContext, 'YouTube', undefined, spatialRealRef);
 
   const liveFrameSrc = (frame: { dataUrl?: string; fileName?: string }) => {
     const base = motionStatus.exportBaseUrl;
@@ -712,6 +725,8 @@ export function YouTubeLiveCompanionDemo() {
           </div>
           <div className="flex-1 flex flex-col items-center justify-center text-center p-6">
             <SpatialRealAvatar
+              ref={spatialRealRef}
+              onUserMessage={(text) => sendMessage(text)}
               avatarWidth={300}
               avatarHeight={400}
             />
