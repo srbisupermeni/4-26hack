@@ -9,3 +9,5 @@ coverage/
 .env*
 !.env.example
 backend/motion_exports/
+tools/live_subtract/*.txt
+tools/subtitle_extraction/subs/
