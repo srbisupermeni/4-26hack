@@ -5,7 +5,6 @@ python-multipart
 google-genai
 python-dotenv
 requests
-openai
 opencv-python
 numpy
 yt-dlp

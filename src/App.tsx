@@ -32,8 +32,6 @@ import { useAICompanion } from './hooks/useAICompanion';
 import { PetChatPanel } from './components/PetChatPanel';
 import { PipelineBuilder } from './components/PipelineBuilder';
 import { YouTubeLiveCompanionDemo } from './components/YouTubeLiveCompanionDemo';
-import { requestPipelineReaction } from './lib/pipelineClient';
-
 // --- Components ---
 
 const ChatModal = ({ isOpen, onClose, activeSport }: { isOpen: boolean, onClose: () => void, activeSport: string }) => {
@@ -57,27 +55,23 @@ const ChatModal = ({ isOpen, onClose, activeSport }: { isOpen: boolean, onClose:
     setIsLoading(true);
 
     try {
-      const data = await requestPipelineReaction({
-        triggerReason: 'user_message',
-        userMessage,
-        activeSport,
-        persona: 'analyst',
-        gameContext: {
-          teams: `${activeSport} Demo`,
-          score: 'Pre-game',
-          clock: '00:00',
-          lastPlay: 'Marketing chat opened from the hero section.',
-          excitement: 0.4,
-        },
-        chatHistory: messages.map(msg => ({
-          role: msg.role === 'model' ? 'ai' : 'user',
-          content: msg.text,
-        })),
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userMessage,
+          activeSport,
+          persona: 'analyst',
+          chatHistory: messages.map(msg => ({
+            role: msg.role === 'model' ? 'ai' : 'user',
+            content: msg.text,
+          })),
+        }),
       });
-
-      if (!data.output?.text) throw new Error('Pipeline returned no text');
-
-      setMessages(prev => [...prev, { role: 'model', text: data.output.text }]);
+      if (!res.ok) throw new Error('Chat failed');
+      const text = await res.text();
+      if (!text) throw new Error('Empty response');
+      setMessages(prev => [...prev, { role: 'model', text }]);
     } catch (error) {
       console.error("Chat error:", error);
       setMessages(prev => [...prev, { role: 'model', text: "Whoops, I missed that play. What happened?" }]);
