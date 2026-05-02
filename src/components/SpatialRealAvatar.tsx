@@ -81,6 +81,7 @@ const SpatialRealAvatar = forwardRef<SpatialRealAvatarHandle, Props>(
     const [micState, setMicState] = useState<MicState>('idle');
     const [lastHeard, setLastHeard] = useState('');
     const [lastSpoken, setLastSpoken] = useState('');
+    const [srError, setSrError] = useState('');
 
     // ── SDK init ──────────────────────────────────────────────────────────────
     useEffect(() => {
@@ -179,11 +180,43 @@ const SpatialRealAvatar = forwardRef<SpatialRealAvatarHandle, Props>(
       }
     };
 
+    // ── MediaRecorder-based STT (Whisper via backend, works on HTTP) ─────────
+    const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+    const audioChunksRef = useRef<Blob[]>([]);
+
+    const stopRecording = () => {
+      mediaRecorderRef.current?.stop();
+      mediaRecorderRef.current?.stream.getTracks().forEach(t => t.stop());
+      mediaRecorderRef.current = null;
+    };
+
+    const transcribeAndRespond = async (audioBlob: Blob) => {
+      setMicState('thinking');
+      try {
+        const formData = new FormData();
+        formData.append('file', audioBlob, 'audio.webm');
+        const res = await fetch('/api/stt', { method: 'POST', body: formData });
+        if (!res.ok) throw new Error(`STT failed: ${res.status}`);
+        const { text } = await res.json();
+        if (!text?.trim()) {
+          setSrError('未检测到语音，请重试');
+          setMicState('idle');
+          return;
+        }
+        setLastHeard(text);
+        const response = TEMPLATES[Math.floor(Math.random() * TEMPLATES.length)];
+        await speakText(response);
+      } catch (e: any) {
+        setSrError(e?.message ?? '转写失败，请重试');
+        setMicState('idle');
+      }
+    };
+
     // ── Mic button handler ────────────────────────────────────────────────────
     const handleMicClick = async () => {
       // Stop if already listening
       if (micState === 'listening') {
-        recognitionRef.current?.stop();
+        stopRecording();
         return;
       }
       // Stop if avatar is speaking
@@ -202,36 +235,44 @@ const SpatialRealAvatar = forwardRef<SpatialRealAvatarHandle, Props>(
         } catch (_) {}
       }
 
-      // Start speech recognition
-      const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-      if (!SR) {
-        // Fallback: just speak a random template if no SpeechRecognition API
-        const response = TEMPLATES[Math.floor(Math.random() * TEMPLATES.length)];
-        await speakText(response);
-        return;
+      setSrError('');
+
+      // Use MediaRecorder → Whisper (works on HTTP/Safari/all browsers)
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+          ? 'audio/webm;codecs=opus'
+          : MediaRecorder.isTypeSupported('audio/webm')
+          ? 'audio/webm'
+          : 'audio/mp4';
+
+        const recorder = new MediaRecorder(stream, { mimeType });
+        audioChunksRef.current = [];
+
+        recorder.ondataavailable = (e) => {
+          if (e.data.size > 0) audioChunksRef.current.push(e.data);
+        };
+
+        recorder.onstop = () => {
+          const blob = new Blob(audioChunksRef.current, { type: mimeType });
+          transcribeAndRespond(blob);
+        };
+
+        mediaRecorderRef.current = recorder;
+        recorder.start();
+        setMicState('listening');
+
+        // Auto-stop after 10s
+        setTimeout(() => {
+          if (mediaRecorderRef.current?.state === 'recording') stopRecording();
+        }, 10000);
+      } catch (e: any) {
+        const msg = e?.name === 'NotAllowedError'
+          ? '麦克风权限被拒绝，请在浏览器设置中允许'
+          : `麦克风错误: ${e?.message ?? e}`;
+        setSrError(msg);
+        setMicState('idle');
       }
-
-      const rec = new SR();
-      rec.lang = 'en-US';
-      rec.interimResults = false;
-      rec.maxAlternatives = 1;
-
-      rec.onstart = () => setMicState('listening');
-
-      rec.onresult = async (event: any) => {
-        const transcript = event.results[0][0].transcript;
-        setLastHeard(transcript);
-        // ── REPLACE THIS with your agent call ────────────────────────────────
-        const response = TEMPLATES[Math.floor(Math.random() * TEMPLATES.length)];
-        // ─────────────────────────────────────────────────────────────────────
-        await speakText(response);
-      };
-
-      rec.onerror = () => setMicState('idle');
-      rec.onend = () => setMicState((s) => s === 'listening' ? 'idle' : s);
-
-      recognitionRef.current = rec;
-      rec.start();
     };
 
     // ── Expose handle for parent (useAICompanion path) ────────────────────────
@@ -289,6 +330,11 @@ const SpatialRealAvatar = forwardRef<SpatialRealAvatarHandle, Props>(
 
         {/* Mic button */}
         <div className="mt-3 flex flex-col items-center gap-1">
+          {srError && (
+            <div className="mb-1 px-3 py-1 rounded-lg bg-red-500/20 text-red-400 text-[10px] text-center max-w-[220px]">
+              {srError}
+            </div>
+          )}
           <button
             onClick={handleMicClick}
             disabled={isDisabled}
@@ -297,7 +343,7 @@ const SpatialRealAvatar = forwardRef<SpatialRealAvatarHandle, Props>(
               boxShadow: micState === 'listening' ? `0 0 0 8px ${micColor}33` : 'none',
               transition: 'all 0.2s',
             }}
-            className="w-14 h-14 rounded-full flex items-center justify-center disabled:opacity-40"
+            className="w-14 h-14 rounded-full flex items-center justify-center disabled:opacity-40 hover:brightness-125 active:scale-90"
           >
             {micState === 'listening' ? (
               // Stop icon

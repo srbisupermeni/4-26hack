@@ -1095,6 +1095,22 @@ async def fetch_tts(request: Request):
     except Exception as e:
         return Response(content=str(e), status_code=500)
 
+@app.post("/api/stt")
+async def speech_to_text(file: UploadFile = File(...)):
+    try:
+        client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        audio_bytes = await file.read()
+        # Whisper needs a filename with extension to detect format
+        fname = file.filename or "audio.webm"
+        transcription = await client.audio.transcriptions.create(
+            model="whisper-1",
+            file=(fname, audio_bytes, file.content_type or "audio/webm"),
+        )
+        return {"text": transcription.text}
+    except Exception as e:
+        return Response(content=str(e), status_code=500)
+
+
 @app.post("/api/vision/analyze")
 async def analyze_video_vision(file: UploadFile = File(...), persona: str = "analyst"):
     """Uploaded a video clip, analyze with Gemini, return a JSON reaction timeline."""
